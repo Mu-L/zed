@@ -363,15 +363,6 @@ pub struct Size<T: Clone + Default + Debug> {
     pub height: T,
 }
 
-impl From<Size<DevicePixels>> for Size<Pixels> {
-    fn from(size: Size<DevicePixels>) -> Self {
-        Size {
-            width: Pixels(size.width.0 as f32),
-            height: Pixels(size.height.0 as f32),
-        }
-    }
-}
-
 /// Constructs a new `Size<T>` with the provided width and height.
 ///
 /// # Arguments
@@ -528,6 +519,35 @@ where
             },
         }
     }
+    /// Returns a new `Size` with the minimum width and height from `self` and `other`.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - A reference to another `Size` to compare with `self`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use zed::Size;
+    /// let size1 = Size { width: 30, height: 40 };
+    /// let size2 = Size { width: 50, height: 20 };
+    /// let min_size = size1.min(&size2);
+    /// assert_eq!(min_size, Size { width: 30, height: 20 });
+    /// ```
+    pub fn min(&self, other: &Self) -> Self {
+        Size {
+            width: if self.width >= other.width {
+                other.width.clone()
+            } else {
+                self.width.clone()
+            },
+            height: if self.height >= other.height {
+                other.height.clone()
+            } else {
+                self.height.clone()
+            },
+        }
+    }
 }
 
 impl<T> Sub for Size<T>
@@ -604,15 +624,6 @@ impl<T: Clone + Default + Debug> From<Point<T>> for Size<T> {
     }
 }
 
-impl From<Size<Pixels>> for Size<DevicePixels> {
-    fn from(size: Size<Pixels>) -> Self {
-        Size {
-            width: DevicePixels(size.width.0 as i32),
-            height: DevicePixels(size.height.0 as i32),
-        }
-    }
-}
-
 impl From<Size<Pixels>> for Size<DefiniteLength> {
     fn from(size: Size<Pixels>) -> Self {
         Size {
@@ -683,7 +694,7 @@ impl Size<Length> {
 /// assert_eq!(bounds.origin, origin);
 /// assert_eq!(bounds.size, size);
 /// ```
-#[derive(Refineable, Clone, Default, Debug, Eq, PartialEq)]
+#[derive(Refineable, Clone, Default, Debug, Eq, PartialEq, Hash)]
 #[refineable(Debug)]
 #[repr(C)]
 pub struct Bounds<T: Clone + Default + Debug> {
@@ -693,28 +704,27 @@ pub struct Bounds<T: Clone + Default + Debug> {
     pub size: Size<T>,
 }
 
-impl Bounds<DevicePixels> {
+impl Bounds<Pixels> {
     /// Generate a centered bounds for the given display or primary display if none is provided
     pub fn centered(
         display_id: Option<DisplayId>,
-        size: impl Into<Size<DevicePixels>>,
+        size: Size<Pixels>,
         cx: &mut AppContext,
     ) -> Self {
         let display = display_id
             .and_then(|id| cx.find_display(id))
             .or_else(|| cx.primary_display());
 
-        let size = size.into();
         display
             .map(|display| {
                 let center = display.bounds().center();
                 Bounds {
-                    origin: point(center.x - size.width / 2, center.y - size.height / 2),
+                    origin: point(center.x - size.width / 2., center.y - size.height / 2.),
                     size,
                 }
             })
             .unwrap_or_else(|| Bounds {
-                origin: point(DevicePixels(0), DevicePixels(0)),
+                origin: point(px(0.), px(0.)),
                 size,
             })
     }
@@ -728,8 +738,8 @@ impl Bounds<DevicePixels> {
         display
             .map(|display| display.bounds())
             .unwrap_or_else(|| Bounds {
-                origin: point(DevicePixels(0), DevicePixels(0)),
-                size: size(DevicePixels(1024), DevicePixels(768)),
+                origin: point(px(0.), px(0.)),
+                size: size(px(1024.), px(768.)),
             })
     }
 }
@@ -1228,6 +1238,7 @@ where
     ///     origin: Point { x: 15.0, y: 15.0 },
     ///     size: Size { width: 15.0, height: 30.0 },
     /// });
+    /// ```
     pub fn map<U>(&self, f: impl Fn(T) -> U) -> Bounds<U>
     where
         U: Clone + Default + Debug,
@@ -1254,6 +1265,7 @@ where
     ///     origin: Point { x: 15.0, y: 15.0 },
     ///     size: Size { width: 10.0, height: 20.0 },
     /// });
+    /// ```
     pub fn map_origin(self, f: impl Fn(Point<T>) -> Point<T>) -> Bounds<T> {
         Bounds {
             origin: f(self.origin),
@@ -1275,6 +1287,26 @@ impl<T: PartialOrd + Default + Debug + Clone> Bounds<T> {
     /// Returns `true` if either the width or the height of the bounds is less than or equal to zero, indicating an empty area.
     pub fn is_empty(&self) -> bool {
         self.size.width <= T::default() || self.size.height <= T::default()
+    }
+}
+
+impl Size<DevicePixels> {
+    /// Converts the size from physical to logical pixels.
+    pub(crate) fn to_pixels(self, scale_factor: f32) -> Size<Pixels> {
+        size(
+            px(self.width.0 as f32 / scale_factor),
+            px(self.height.0 as f32 / scale_factor),
+        )
+    }
+}
+
+impl Size<Pixels> {
+    /// Converts the size from physical to logical pixels.
+    pub(crate) fn to_device_pixels(self, scale_factor: f32) -> Size<DevicePixels> {
+        size(
+            DevicePixels((self.width.0 * scale_factor) as i32),
+            DevicePixels((self.height.0 * scale_factor) as i32),
+        )
     }
 }
 
@@ -1313,6 +1345,30 @@ impl Bounds<Pixels> {
         Bounds {
             origin: self.origin.scale(factor),
             size: self.size.scale(factor),
+        }
+    }
+
+    /// Convert the bounds from logical pixels to physical pixels
+    pub fn to_device_pixels(&self, factor: f32) -> Bounds<DevicePixels> {
+        Bounds {
+            origin: point(
+                DevicePixels((self.origin.x.0 * factor) as i32),
+                DevicePixels((self.origin.y.0 * factor) as i32),
+            ),
+            size: self.size.to_device_pixels(factor),
+        }
+    }
+}
+
+impl Bounds<DevicePixels> {
+    /// Convert the bounds from physical pixels to logical pixels
+    pub fn to_pixels(self, scale_factor: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(
+                px(self.origin.x.0 as f32 / scale_factor),
+                px(self.origin.y.0 as f32 / scale_factor),
+            ),
+            size: self.size.to_pixels(scale_factor),
         }
     }
 }
@@ -2101,6 +2157,12 @@ impl From<Percentage> for Radians {
 #[repr(transparent)]
 pub struct Pixels(pub f32);
 
+impl std::fmt::Display for Pixels {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("{}px", self.0))
+    }
+}
+
 impl std::ops::Div for Pixels {
     type Output = f32;
 
@@ -2224,6 +2286,15 @@ impl Pixels {
     /// A new `Pixels` instance with the absolute value of the original `Pixels`.
     pub fn abs(&self) -> Self {
         Self(self.0.abs())
+    }
+
+    /// Returns the f64 value of `Pixels`.
+    ///
+    /// # Returns
+    ///
+    /// A f64 value of the `Pixels`.
+    pub fn to_f64(self) -> f64 {
+        self.0 as f64
     }
 }
 

@@ -106,8 +106,12 @@ async fn get_extension_versions(
 }
 
 #[derive(Debug, Deserialize)]
-struct DownloadLatestExtensionParams {
+struct DownloadLatestExtensionPathParams {
     extension_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadLatestExtensionQueryParams {
     min_schema_version: Option<i32>,
     max_schema_version: Option<i32>,
     min_wasm_api_version: Option<SemanticVersion>,
@@ -116,13 +120,14 @@ struct DownloadLatestExtensionParams {
 
 async fn download_latest_extension(
     Extension(app): Extension<Arc<AppState>>,
-    Path(params): Path<DownloadLatestExtensionParams>,
+    Path(params): Path<DownloadLatestExtensionPathParams>,
+    Query(query): Query<DownloadLatestExtensionQueryParams>,
 ) -> Result<Redirect> {
     let constraints = maybe!({
-        let min_schema_version = params.min_schema_version?;
-        let max_schema_version = params.max_schema_version?;
-        let min_wasm_api_version = params.min_wasm_api_version?;
-        let max_wasm_api_version = params.max_wasm_api_version?;
+        let min_schema_version = query.min_schema_version?;
+        let max_schema_version = query.max_schema_version?;
+        let min_wasm_api_version = query.min_wasm_api_version?;
+        let max_wasm_api_version = query.max_wasm_api_version?;
 
         Some(ExtensionVersionConstraints {
             schema_versions: min_schema_version..=max_schema_version,
@@ -234,61 +239,74 @@ async fn fetch_extensions_from_blob_store(
 ) -> anyhow::Result<()> {
     log::info!("fetching extensions from blob store");
 
-    let list = blob_store_client
-        .list_objects()
-        .bucket(blob_store_bucket)
-        .prefix("extensions/")
-        .send()
-        .await?;
+    let mut next_marker = None;
+    let mut published_versions = HashMap::<String, Vec<String>>::default();
 
-    let objects = list.contents.unwrap_or_default();
+    loop {
+        let list = blob_store_client
+            .list_objects()
+            .bucket(blob_store_bucket)
+            .prefix("extensions/")
+            .set_marker(next_marker.clone())
+            .send()
+            .await?;
+        let objects = list.contents.unwrap_or_default();
+        log::info!("fetched {} object(s) from blob store", objects.len());
 
-    let mut published_versions = HashMap::<&str, Vec<&str>>::default();
-    for object in &objects {
-        let Some(key) = object.key.as_ref() else {
-            continue;
-        };
-        let mut parts = key.split('/');
-        let Some(_) = parts.next().filter(|part| *part == "extensions") else {
-            continue;
-        };
-        let Some(extension_id) = parts.next() else {
-            continue;
-        };
-        let Some(version) = parts.next() else {
-            continue;
-        };
-        if parts.next() == Some("manifest.json") {
-            published_versions
-                .entry(extension_id)
-                .or_default()
-                .push(version);
+        for object in &objects {
+            let Some(key) = object.key.as_ref() else {
+                continue;
+            };
+            let mut parts = key.split('/');
+            let Some(_) = parts.next().filter(|part| *part == "extensions") else {
+                continue;
+            };
+            let Some(extension_id) = parts.next() else {
+                continue;
+            };
+            let Some(version) = parts.next() else {
+                continue;
+            };
+            if parts.next() == Some("manifest.json") {
+                published_versions
+                    .entry(extension_id.to_owned())
+                    .or_default()
+                    .push(version.to_owned());
+            }
+        }
+
+        if let (Some(true), Some(last_object)) = (list.is_truncated, objects.last()) {
+            next_marker.clone_from(&last_object.key);
+        } else {
+            break;
         }
     }
+
+    log::info!("found {} published extensions", published_versions.len());
 
     let known_versions = app_state.db.get_known_extension_versions().await?;
 
     let mut new_versions = HashMap::<&str, Vec<NewExtensionVersion>>::default();
     let empty = Vec::new();
-    for (extension_id, published_versions) in published_versions {
+    for (extension_id, published_versions) in &published_versions {
         let known_versions = known_versions.get(extension_id).unwrap_or(&empty);
 
         for published_version in published_versions {
             if known_versions
-                .binary_search_by_key(&published_version, String::as_str)
+                .binary_search_by_key(&published_version, |known_version| known_version)
                 .is_err()
             {
                 if let Some(extension) = fetch_extension_manifest(
                     blob_store_client,
                     blob_store_bucket,
-                    extension_id,
-                    published_version,
+                    &extension_id,
+                    &published_version,
                 )
                 .await
                 .log_err()
                 {
                     new_versions
-                        .entry(extension_id)
+                        .entry(&extension_id)
                         .or_default()
                         .push(extension);
                 }

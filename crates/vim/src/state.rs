@@ -1,11 +1,13 @@
 use std::{fmt::Display, ops::Range, sync::Arc};
 
-use crate::motion::Motion;
+use crate::surrounds::SurroundsType;
+use crate::{motion::Motion, object::Object};
 use collections::HashMap;
-use editor::Anchor;
-use gpui::{Action, KeyContext};
+use editor::{Anchor, ClipboardSelection};
+use gpui::{Action, ClipboardItem, KeyContext};
 use language::{CursorShape, Selection, TransactionId};
 use serde::{Deserialize, Serialize};
+use ui::SharedString;
 use workspace::searchable::Direction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -55,6 +57,17 @@ pub enum Operator {
     Object { around: bool },
     FindForward { before: bool },
     FindBackward { after: bool },
+    AddSurrounds { target: Option<SurroundsType> },
+    ChangeSurrounds { target: Option<Object> },
+    DeleteSurrounds,
+    Mark,
+    Jump { line: bool },
+    Indent,
+    Outdent,
+    Lowercase,
+    Uppercase,
+    OppositeCase,
+    Register,
 }
 
 #[derive(Default, Clone)]
@@ -70,9 +83,17 @@ pub struct EditorState {
     pub operator_stack: Vec<Operator>,
     pub replacements: Vec<(Range<editor::Anchor>, String)>,
 
+    pub marks: HashMap<String, Vec<Anchor>>,
+    pub stored_visual_mode: Option<(Mode, Vec<bool>)>,
+    pub change_list: Vec<Vec<Anchor>>,
+    pub change_list_position: Option<usize>,
+
     pub current_tx: Option<TransactionId>,
     pub current_anchor: Option<Selection<Anchor>>,
     pub undo_modes: HashMap<TransactionId, Mode>,
+
+    pub selected_register: Option<char>,
+    pub search: SearchState,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -95,9 +116,43 @@ pub enum RecordedSelection {
     },
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct Register {
+    pub(crate) text: SharedString,
+    pub(crate) clipboard_selections: Option<Vec<ClipboardSelection>>,
+}
+
+impl From<Register> for ClipboardItem {
+    fn from(register: Register) -> Self {
+        let item = ClipboardItem::new(register.text.into());
+        if let Some(clipboard_selections) = register.clipboard_selections {
+            item.with_metadata(clipboard_selections)
+        } else {
+            item
+        }
+    }
+}
+
+impl From<ClipboardItem> for Register {
+    fn from(value: ClipboardItem) -> Self {
+        Register {
+            text: value.text().to_owned().into(),
+            clipboard_selections: value.metadata::<Vec<ClipboardSelection>>(),
+        }
+    }
+}
+
+impl From<String> for Register {
+    fn from(text: String) -> Self {
+        Register {
+            text: text.into(),
+            clipboard_selections: None,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct WorkspaceState {
-    pub search: SearchState,
     pub last_find: Option<Motion>,
 
     pub recording: bool,
@@ -107,7 +162,8 @@ pub struct WorkspaceState {
     pub recorded_actions: Vec<ReplayableAction>,
     pub recorded_selection: RecordedSelection,
 
-    pub registers: HashMap<String, String>,
+    pub last_yank: Option<SharedString>,
+    pub registers: HashMap<char, Register>,
 }
 
 #[derive(Debug)]
@@ -134,21 +190,15 @@ impl Clone for ReplayableAction {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default, Debug)]
 pub struct SearchState {
     pub direction: Direction,
     pub count: usize,
     pub initial_query: String,
-}
 
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            direction: Direction::Next,
-            count: 1,
-            initial_query: "".to_string(),
-        }
-    }
+    pub prior_selections: Vec<Range<Anchor>>,
+    pub prior_operator: Option<Operator>,
+    pub prior_mode: Mode,
 }
 
 impl EditorState {
@@ -174,7 +224,11 @@ impl EditorState {
         }
         matches!(
             self.operator_stack.last(),
-            Some(Operator::FindForward { .. }) | Some(Operator::FindBackward { .. })
+            Some(Operator::FindForward { .. })
+                | Some(Operator::FindBackward { .. })
+                | Some(Operator::Mark)
+                | Some(Operator::Register)
+                | Some(Operator::Jump { .. })
         )
     }
 
@@ -196,7 +250,7 @@ impl EditorState {
     }
 
     pub fn keymap_context_layer(&self) -> KeyContext {
-        let mut context = KeyContext::default();
+        let mut context = KeyContext::new_with_defaults();
         context.set(
             "vim_mode",
             match self.mode {
@@ -233,7 +287,10 @@ impl EditorState {
                 .unwrap_or_else(|| "none"),
         );
 
-        if self.mode == Mode::Replace {
+        if self.mode == Mode::Replace
+            || (matches!(active_operator, Some(Operator::AddSurrounds { .. }))
+                && self.mode.is_visual())
+        {
             context.add("VimWaiting");
         }
         context
@@ -253,15 +310,33 @@ impl Operator {
             Operator::FindForward { before: true } => "t",
             Operator::FindBackward { after: false } => "F",
             Operator::FindBackward { after: true } => "T",
+            Operator::AddSurrounds { .. } => "ys",
+            Operator::ChangeSurrounds { .. } => "cs",
+            Operator::DeleteSurrounds => "ds",
+            Operator::Mark => "m",
+            Operator::Jump { line: true } => "'",
+            Operator::Jump { line: false } => "`",
+            Operator::Indent => ">",
+            Operator::Outdent => "<",
+            Operator::Uppercase => "gU",
+            Operator::Lowercase => "gu",
+            Operator::OppositeCase => "g~",
+            Operator::Register => "\"",
         }
     }
 
     pub fn context_flags(&self) -> &'static [&'static str] {
         match self {
-            Operator::Object { .. } => &["VimObject"],
-            Operator::FindForward { .. } | Operator::FindBackward { .. } | Operator::Replace => {
-                &["VimWaiting"]
-            }
+            Operator::Object { .. } | Operator::ChangeSurrounds { target: None } => &["VimObject"],
+            Operator::FindForward { .. }
+            | Operator::Mark
+            | Operator::Jump { .. }
+            | Operator::FindBackward { .. }
+            | Operator::Register
+            | Operator::Replace
+            | Operator::AddSurrounds { target: Some(_) }
+            | Operator::ChangeSurrounds { .. }
+            | Operator::DeleteSurrounds => &["VimWaiting"],
             _ => &[],
         }
     }

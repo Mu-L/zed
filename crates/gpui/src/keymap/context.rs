@@ -25,6 +25,20 @@ impl<'a> TryFrom<&'a str> for KeyContext {
 }
 
 impl KeyContext {
+    /// Initialize a new [`KeyContext`] that contains an `os` key set to either `macos`, `linux`, `windows` or `unknown`.
+    pub fn new_with_defaults() -> Self {
+        let mut context = Self::default();
+        #[cfg(target_os = "macos")]
+        context.set("os", "macos");
+        #[cfg(target_os = "linux")]
+        context.set("os", "linux");
+        #[cfg(target_os = "windows")]
+        context.set("os", "windows");
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        context.set("os", "unknown");
+        context
+    }
+
     /// Parse a key context from a string.
     /// The key context format is very simple:
     /// - either a single identifier, such as `StatusBar`
@@ -281,12 +295,20 @@ impl KeyBindingContextPredicate {
             }
             _ if is_identifier_char(next) => {
                 let len = source
-                    .find(|c: char| !is_identifier_char(c))
+                    .find(|c: char| !is_identifier_char(c) && !is_vim_operator_char(c))
                     .unwrap_or(source.len());
                 let (identifier, rest) = source.split_at(len);
                 source = skip_whitespace(rest);
                 Ok((
                     KeyBindingContextPredicate::Identifier(identifier.to_string().into()),
+                    source,
+                ))
+            }
+            _ if is_vim_operator_char(next) => {
+                let (operator, rest) = source.split_at(1);
+                source = skip_whitespace(rest);
+                Ok((
+                    KeyBindingContextPredicate::Identifier(operator.to_string().into()),
                     source,
                 ))
             }
@@ -331,6 +353,10 @@ const PRECEDENCE_NOT: u32 = 5;
 
 fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+fn is_vim_operator_char(c: char) -> bool {
+    c == '>' || c == '<' || c == '~' || c == '"'
 }
 
 fn skip_whitespace(source: &str) -> &str {

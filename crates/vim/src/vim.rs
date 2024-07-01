@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod test;
 
+mod change_list;
 mod command;
 mod editor_events;
 mod insert;
@@ -12,31 +13,33 @@ mod normal;
 mod object;
 mod replace;
 mod state;
-mod utils;
+mod surrounds;
 mod visual;
 
 use anyhow::Result;
+use change_list::push_to_change_list;
 use collections::HashMap;
 use command_palette_hooks::{CommandPaletteFilter, CommandPaletteInterceptor};
 use editor::{
     movement::{self, FindRange},
-    Editor, EditorEvent, EditorMode,
+    Anchor, Bias, Editor, EditorEvent, EditorMode, ToPoint,
 };
 use gpui::{
     actions, impl_actions, Action, AppContext, EntityId, FocusableView, Global, KeystrokeEvent,
-    Subscription, View, ViewContext, WeakView, WindowContext,
+    Subscription, UpdateGlobal, View, ViewContext, WeakView, WindowContext,
 };
-use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
+use language::{CursorShape, Point, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
-use normal::normal_replace;
+use normal::{mark::create_visual_marks, normal_replace};
 use replace::multi_replace;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_derive::Serialize;
-use settings::{update_settings_file, Settings, SettingsStore};
-use state::{EditorState, Mode, Operator, RecordedSelection, WorkspaceState};
+use settings::{update_settings_file, Settings, SettingsSources, SettingsStore};
+use state::{EditorState, Mode, Operator, RecordedSelection, Register, WorkspaceState};
 use std::{ops::Range, sync::Arc};
+use surrounds::{add_surrounds, change_surrounds, delete_surrounds, SurroundsType};
 use ui::BorrowAppContext;
 use visual::{visual_block_motion, visual_replace};
 use workspace::{self, Workspace};
@@ -63,15 +66,26 @@ pub struct PushOperator(pub Operator);
 #[derive(Clone, Deserialize, PartialEq)]
 struct Number(usize);
 
+#[derive(Clone, Deserialize, PartialEq)]
+struct SelectRegister(String);
+
 actions!(
     vim,
-    [Tab, Enter, Object, InnerObject, FindForward, FindBackward]
+    [
+        Tab,
+        Enter,
+        Object,
+        InnerObject,
+        FindForward,
+        FindBackward,
+        OpenDefaultKeymap
+    ]
 );
 
 // in the workspace namespace so it's not filtered out when vim is disabled.
 actions!(workspace, [ToggleVimMode]);
 
-impl_actions!(vim, [SwitchMode, PushOperator, Number]);
+impl_actions!(vim, [SwitchMode, PushOperator, Number, SelectRegister]);
 
 /// Initializes the `vim` crate.
 pub fn init(cx: &mut AppContext) {
@@ -91,11 +105,11 @@ pub fn init(cx: &mut AppContext) {
     CommandPaletteFilter::update_global(cx, |filter, _| {
         filter.hide_namespace(Vim::NAMESPACE);
     });
-    cx.update_global(|vim: &mut Vim, cx: &mut AppContext| {
+    Vim::update_global(cx, |vim, cx| {
         vim.set_enabled(VimModeSetting::get_global(cx).0, cx)
     });
     cx.observe_global::<SettingsStore>(|cx| {
-        cx.update_global(|vim: &mut Vim, cx: &mut AppContext| {
+        Vim::update_global(cx, |vim, cx| {
             vim.set_enabled(VimModeSetting::get_global(cx).0, cx)
         });
     })
@@ -114,7 +128,6 @@ fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
     workspace.register_action(|_: &mut Workspace, n: &Number, cx: _| {
         Vim::update(cx, |vim, cx| vim.push_count_digit(n.0, cx));
     });
-
     workspace.register_action(|_: &mut Workspace, _: &Tab, cx| {
         Vim::active_editor_input_ignored(" ".into(), cx)
     });
@@ -131,6 +144,14 @@ fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
         })
     });
 
+    workspace.register_action(|_: &mut Workspace, _: &OpenDefaultKeymap, cx| {
+        cx.emit(workspace::Event::OpenBundledFile {
+            text: settings::vim_keymap(),
+            title: "Default Vim Bindings",
+            language: "JSON",
+        });
+    });
+
     normal::register(workspace, cx);
     insert::register(workspace, cx);
     motion::register(workspace, cx);
@@ -138,6 +159,7 @@ fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
     replace::register(workspace, cx);
     object::register(workspace, cx);
     visual::register(workspace, cx);
+    change_list::register(workspace, cx);
 }
 
 /// Called whenever an keystroke is typed so vim can observe all actions
@@ -165,12 +187,22 @@ fn observe_keystrokes(keystroke_event: &KeystrokeEvent, cx: &mut WindowContext) 
         if action.name().starts_with("vim::") {
             return;
         }
-    } else if cx.has_pending_keystrokes() {
+    } else if cx.has_pending_keystrokes() || keystroke_event.keystroke.is_ime_in_progress() {
         return;
     }
 
     Vim::update(cx, |vim, cx| match vim.active_operator() {
-        Some(Operator::FindForward { .. } | Operator::FindBackward { .. } | Operator::Replace) => {}
+        Some(
+            Operator::FindForward { .. }
+            | Operator::FindBackward { .. }
+            | Operator::Replace
+            | Operator::AddSurrounds { .. }
+            | Operator::ChangeSurrounds { .. }
+            | Operator::DeleteSurrounds
+            | Operator::Mark
+            | Operator::Jump { .. }
+            | Operator::Register,
+        ) => {}
         Some(_) => {
             vim.clear_operator(cx);
         }
@@ -214,12 +246,9 @@ impl Vim {
         self.active_editor = Some(editor.clone().downgrade());
         self.editor_subscription = Some(cx.subscribe(&editor, |editor, event, cx| match event {
             EditorEvent::SelectionsChanged { local: true } => {
-                let editor = editor.read(cx);
-                if editor.leader_peer_id().is_none() {
-                    let newest = editor.selections.newest_anchor().clone();
-                    let is_multicursor = editor.selections.count() > 1;
+                if editor.read(cx).leader_peer_id().is_none() {
                     Vim::update(cx, |vim, cx| {
-                        vim.local_selections_changed(newest, is_multicursor, cx);
+                        vim.local_selections_changed(editor, cx);
                     })
                 }
             }
@@ -237,6 +266,9 @@ impl Vim {
             EditorEvent::TransactionUndone { transaction_id } => Vim::update(cx, |vim, cx| {
                 vim.transaction_undone(transaction_id, cx);
             }),
+            EditorEvent::Edited { .. } => {
+                Vim::update(cx, |vim, cx| vim.transaction_ended(editor, cx))
+            }
             _ => {}
         }));
 
@@ -286,6 +318,18 @@ impl Vim {
         Some(editor.update(cx, |editor, cx| update(self, editor, cx)))
     }
 
+    fn editor_selections(&mut self, cx: &mut WindowContext) -> Vec<Range<Anchor>> {
+        self.update_active_editor(cx, |_, editor, _| {
+            editor
+                .selections
+                .disjoint_anchors()
+                .iter()
+                .map(|selection| selection.tail()..selection.head())
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// When doing an action that modifies the buffer, we start recording so that `.`
     /// will replay the action.
     pub fn start_recording(&mut self, cx: &mut WindowContext) {
@@ -332,6 +376,10 @@ impl Vim {
         }
     }
 
+    pub fn stop_replaying(&mut self) {
+        self.workspace_state.replaying = false;
+    }
+
     /// When finishing an action that modifies the buffer, stop recording.
     /// as you usually call this within a keystroke handler we also ensure that
     /// the current action is recorded.
@@ -370,15 +418,21 @@ impl Vim {
             state.last_mode = last_mode;
             state.mode = mode;
             state.operator_stack.clear();
-            state.current_tx.take();
-            state.current_anchor.take();
+            if mode == Mode::Normal || mode != last_mode {
+                state.current_tx.take();
+                state.current_anchor.take();
+            }
         });
-        if mode != Mode::Insert {
+        if mode != Mode::Insert && mode != Mode::Replace {
             self.take_count(cx);
         }
 
         // Sync editor settings like clip mode
         self.sync_vim_settings(cx);
+
+        if !mode.is_visual() && last_mode.is_visual() {
+            create_visual_marks(self, last_mode, cx);
+        }
 
         if leave_selections {
             return;
@@ -414,6 +468,17 @@ impl Vim {
                     s.select_anchor_ranges(vec![pos..pos])
                 }
 
+                let snapshot = s.display_map();
+                if let Some(pending) = s.pending.as_mut() {
+                    if pending.selection.reversed && mode.is_visual() && !last_mode.is_visual() {
+                        let mut end = pending.selection.end.to_point(&snapshot.buffer_snapshot);
+                        end = snapshot
+                            .buffer_snapshot
+                            .clip_point(end + Point::new(0, 1), Bias::Right);
+                        pending.selection.end = snapshot.buffer_snapshot.anchor_before(end);
+                    }
+                }
+
                 s.move_with(|map, selection| {
                     if last_mode.is_visual() && !mode.is_visual() {
                         let mut point = selection.head();
@@ -424,11 +489,6 @@ impl Vim {
                     } else if !last_mode.is_visual() && mode.is_visual() {
                         if selection.is_empty() {
                             selection.end = movement::right(map, selection.start);
-                        }
-                    } else if last_mode == Mode::Replace {
-                        if selection.head().column() != 0 {
-                            let point = movement::left(map, selection.head());
-                            selection.collapse_to(point, selection.goal)
                         }
                     }
                 });
@@ -469,12 +529,175 @@ impl Vim {
         count
     }
 
+    fn select_register(&mut self, register: Arc<str>, cx: &mut WindowContext) {
+        self.update_state(|state| {
+            if register.chars().count() == 1 {
+                state
+                    .selected_register
+                    .replace(register.chars().next().unwrap());
+            }
+            state.operator_stack.clear();
+        });
+        self.sync_vim_settings(cx);
+    }
+
+    fn write_registers(
+        &mut self,
+        content: Register,
+        register: Option<char>,
+        is_yank: bool,
+        linewise: bool,
+        cx: &mut ViewContext<Editor>,
+    ) {
+        if let Some(register) = register {
+            let lower = register.to_lowercase().next().unwrap_or(register);
+            if lower != register {
+                let current = self.workspace_state.registers.entry(lower).or_default();
+                current.text = (current.text.to_string() + &content.text).into();
+                // not clear how to support appending to registers with multiple cursors
+                current.clipboard_selections.take();
+                let yanked = current.clone();
+                self.workspace_state.registers.insert('"', yanked);
+            } else {
+                self.workspace_state.registers.insert('"', content.clone());
+                match lower {
+                    '_' | ':' | '.' | '%' | '#' | '=' | '/' => {}
+                    '+' => {
+                        cx.write_to_clipboard(content.into());
+                    }
+                    '*' => {
+                        #[cfg(target_os = "linux")]
+                        cx.write_to_primary(content.into());
+                        #[cfg(not(target_os = "linux"))]
+                        cx.write_to_clipboard(content.into());
+                    }
+                    '"' => {
+                        self.workspace_state.registers.insert('0', content.clone());
+                        self.workspace_state.registers.insert('"', content);
+                    }
+                    _ => {
+                        self.workspace_state.registers.insert(lower, content);
+                    }
+                }
+            }
+        } else {
+            let setting = VimSettings::get_global(cx).use_system_clipboard;
+            if setting == UseSystemClipboard::Always
+                || setting == UseSystemClipboard::OnYank && is_yank
+            {
+                self.workspace_state.last_yank.replace(content.text.clone());
+                cx.write_to_clipboard(content.clone().into());
+            } else {
+                self.workspace_state.last_yank = cx
+                    .read_from_clipboard()
+                    .map(|item| item.text().to_owned().into());
+            }
+
+            self.workspace_state.registers.insert('"', content.clone());
+            if is_yank {
+                self.workspace_state.registers.insert('0', content);
+            } else {
+                let contains_newline = content.text.contains('\n');
+                if !contains_newline {
+                    self.workspace_state.registers.insert('-', content.clone());
+                }
+                if linewise || contains_newline {
+                    let mut content = content;
+                    for i in '1'..'8' {
+                        if let Some(moved) = self.workspace_state.registers.insert(i, content) {
+                            content = moved;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_register(
+        &mut self,
+        register: Option<char>,
+        editor: Option<&mut Editor>,
+        cx: &mut WindowContext,
+    ) -> Option<Register> {
+        let Some(register) = register.filter(|reg| *reg != '"') else {
+            let setting = VimSettings::get_global(cx).use_system_clipboard;
+            return match setting {
+                UseSystemClipboard::Always => cx.read_from_clipboard().map(|item| item.into()),
+                UseSystemClipboard::OnYank if self.system_clipboard_is_newer(cx) => {
+                    cx.read_from_clipboard().map(|item| item.into())
+                }
+                _ => self.workspace_state.registers.get(&'"').cloned(),
+            };
+        };
+        let lower = register.to_lowercase().next().unwrap_or(register);
+        match lower {
+            '_' | ':' | '.' | '#' | '=' => None,
+            '+' => cx.read_from_clipboard().map(|item| item.into()),
+            '*' => {
+                #[cfg(target_os = "linux")]
+                {
+                    cx.read_from_primary().map(|item| item.into())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    cx.read_from_clipboard().map(|item| item.into())
+                }
+            }
+            '%' => editor.and_then(|editor| {
+                let selection = editor.selections.newest::<Point>(cx);
+                if let Some((_, buffer, _)) = editor
+                    .buffer()
+                    .read(cx)
+                    .excerpt_containing(selection.head(), cx)
+                {
+                    buffer
+                        .read(cx)
+                        .file()
+                        .map(|file| file.path().to_string_lossy().to_string().into())
+                } else {
+                    None
+                }
+            }),
+            _ => self.workspace_state.registers.get(&lower).cloned(),
+        }
+    }
+
+    fn system_clipboard_is_newer(&self, cx: &mut AppContext) -> bool {
+        cx.read_from_clipboard().is_some_and(|item| {
+            if let Some(last_state) = &self.workspace_state.last_yank {
+                last_state != item.text()
+            } else {
+                true
+            }
+        })
+    }
+
     fn push_operator(&mut self, operator: Operator, cx: &mut WindowContext) {
         if matches!(
             operator,
-            Operator::Change | Operator::Delete | Operator::Replace
+            Operator::Change
+                | Operator::Delete
+                | Operator::Replace
+                | Operator::Indent
+                | Operator::Outdent
+                | Operator::Lowercase
+                | Operator::Uppercase
+                | Operator::OppositeCase
         ) {
             self.start_recording(cx)
+        };
+        // Since these operations can only be entered with pre-operators,
+        // we need to clear the previous operators when pushing,
+        // so that the current stack is the most correct
+        if matches!(
+            operator,
+            Operator::AddSurrounds { .. }
+                | Operator::ChangeSurrounds { .. }
+                | Operator::DeleteSurrounds
+        ) {
+            self.update_state(|state| state.operator_stack.clear());
         };
         self.update_state(|state| state.operator_stack.push(operator));
         self.sync_vim_settings(cx);
@@ -490,9 +713,13 @@ impl Vim {
         self.sync_vim_settings(cx);
         popped_operator
     }
+
     fn clear_operator(&mut self, cx: &mut WindowContext) {
         self.take_count(cx);
-        self.update_state(|state| state.operator_stack.clear());
+        self.update_state(|state| {
+            state.selected_register.take();
+            state.operator_stack.clear()
+        });
         self.sync_vim_settings(cx);
     }
 
@@ -519,41 +746,58 @@ impl Vim {
     }
 
     fn transaction_undone(&mut self, transaction_id: &TransactionId, cx: &mut WindowContext) {
-        if !self.state().mode.is_visual() {
-            return;
-        };
-        self.update_active_editor(cx, |vim, editor, cx| {
-            let original_mode = vim.state().undo_modes.get(transaction_id);
-            editor.change_selections(None, cx, |s| match original_mode {
-                Some(Mode::VisualLine) => {
-                    s.move_with(|map, selection| {
-                        selection.collapse_to(
-                            map.prev_line_boundary(selection.start.to_point(map)).1,
-                            SelectionGoal::None,
-                        )
+        match self.state().mode {
+            Mode::VisualLine | Mode::VisualBlock | Mode::Visual => {
+                self.update_active_editor(cx, |vim, editor, cx| {
+                    let original_mode = vim.state().undo_modes.get(transaction_id);
+                    editor.change_selections(None, cx, |s| match original_mode {
+                        Some(Mode::VisualLine) => {
+                            s.move_with(|map, selection| {
+                                selection.collapse_to(
+                                    map.prev_line_boundary(selection.start.to_point(map)).1,
+                                    SelectionGoal::None,
+                                )
+                            });
+                        }
+                        Some(Mode::VisualBlock) => {
+                            let mut first = s.first_anchor();
+                            first.collapse_to(first.start, first.goal);
+                            s.select_anchors(vec![first]);
+                        }
+                        _ => {
+                            s.move_with(|map, selection| {
+                                selection.collapse_to(
+                                    map.clip_at_line_end(selection.start),
+                                    selection.goal,
+                                );
+                            });
+                        }
                     });
-                }
-                Some(Mode::VisualBlock) => {
-                    let mut first = s.first_anchor();
-                    first.collapse_to(first.start, first.goal);
-                    s.select_anchors(vec![first]);
-                }
-                _ => {
-                    s.move_with(|_, selection| {
-                        selection.collapse_to(selection.start, selection.goal);
-                    });
-                }
-            });
-        });
-        self.switch_mode(Mode::Normal, true, cx)
+                });
+                self.switch_mode(Mode::Normal, true, cx)
+            }
+            Mode::Normal => {
+                self.update_active_editor(cx, |_, editor, cx| {
+                    editor.change_selections(None, cx, |s| {
+                        s.move_with(|map, selection| {
+                            selection
+                                .collapse_to(map.clip_at_line_end(selection.end), selection.goal)
+                        })
+                    })
+                });
+            }
+            Mode::Insert | Mode::Replace => {}
+        }
     }
 
-    fn local_selections_changed(
-        &mut self,
-        newest: Selection<editor::Anchor>,
-        is_multicursor: bool,
-        cx: &mut WindowContext,
-    ) {
+    fn transaction_ended(&mut self, editor: View<Editor>, cx: &mut WindowContext) {
+        push_to_change_list(self, editor, cx)
+    }
+
+    fn local_selections_changed(&mut self, editor: View<Editor>, cx: &mut WindowContext) {
+        let newest = editor.read(cx).selections.newest_anchor().clone();
+        let is_multicursor = editor.read(cx).selections.count() > 1;
+
         let state = self.state();
         if state.mode == Mode::Insert && state.current_tx.is_some() {
             if state.current_anchor.is_none() {
@@ -575,7 +819,7 @@ impl Vim {
             && !is_multicursor
             && [Mode::Visual, Mode::VisualLine, Mode::VisualBlock].contains(&state.mode)
         {
-            self.switch_mode(Mode::Normal, true, cx)
+            self.switch_mode(Mode::Normal, true, cx);
         }
     }
 
@@ -622,6 +866,59 @@ impl Vim {
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => visual_replace(text, cx),
                 _ => Vim::update(cx, |vim, cx| vim.clear_operator(cx)),
             },
+            Some(Operator::AddSurrounds { target }) => match Vim::read(cx).state().mode {
+                Mode::Normal => {
+                    if let Some(target) = target {
+                        add_surrounds(text, target, cx);
+                        Vim::update(cx, |vim, cx| vim.clear_operator(cx));
+                    }
+                }
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                    add_surrounds(text, SurroundsType::Selection, cx);
+                    Vim::update(cx, |vim, cx| vim.clear_operator(cx));
+                }
+                _ => Vim::update(cx, |vim, cx| vim.clear_operator(cx)),
+            },
+            Some(Operator::ChangeSurrounds { target }) => match Vim::read(cx).state().mode {
+                Mode::Normal => {
+                    if let Some(target) = target {
+                        change_surrounds(text, target, cx);
+                        Vim::update(cx, |vim, cx| vim.clear_operator(cx));
+                    }
+                }
+                _ => Vim::update(cx, |vim, cx| vim.clear_operator(cx)),
+            },
+            Some(Operator::DeleteSurrounds) => match Vim::read(cx).state().mode {
+                Mode::Normal => {
+                    delete_surrounds(text, cx);
+                    Vim::update(cx, |vim, cx| vim.clear_operator(cx));
+                }
+                _ => Vim::update(cx, |vim, cx| vim.clear_operator(cx)),
+            },
+            Some(Operator::Mark) => Vim::update(cx, |vim, cx| {
+                normal::mark::create_mark(vim, text, false, cx)
+            }),
+            Some(Operator::Register) => Vim::update(cx, |vim, cx| match vim.state().mode {
+                Mode::Insert => {
+                    vim.update_active_editor(cx, |vim, editor, cx| {
+                        if let Some(register) =
+                            vim.read_register(text.chars().next(), Some(editor), cx)
+                        {
+                            editor.do_paste(
+                                &register.text.to_string(),
+                                register.clipboard_selections.clone(),
+                                false,
+                                cx,
+                            )
+                        }
+                    });
+                    vim.clear_operator(cx);
+                }
+                _ => {
+                    vim.select_register(text, cx);
+                }
+            }),
+            Some(Operator::Jump { line }) => normal::mark::jump(text, line, cx),
             _ => match Vim::read(cx).state().mode {
                 Mode::Replace => multi_replace(text, cx),
                 _ => {}
@@ -700,12 +997,11 @@ impl Vim {
             editor.set_input_enabled(!state.vim_controlled());
             editor.set_autoindent(state.should_autoindent());
             editor.selections.line_mode = matches!(state.mode, Mode::VisualLine);
-            if editor.is_focused(cx) {
+            if editor.is_focused(cx) || editor.mouse_menu_is_focused(cx) {
                 editor.set_keymap_context_layer::<Self>(state.keymap_context_layer(), cx);
-            // disables vim if the rename editor is focused,
-            // but not if the command palette is open.
+                // disable vim mode if a sub-editor (inline assist, rename, etc.) is focused
             } else if editor.focus_handle(cx).contains_focused(cx) {
-                editor.remove_keymap_context_layer::<Self>(cx)
+                editor.remove_keymap_context_layer::<Self>(cx);
             }
         });
     }
@@ -728,13 +1024,9 @@ impl Settings for VimModeSetting {
 
     type FileContent = Option<bool>;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self> {
-        Ok(Self(user_values.iter().rev().find_map(|v| **v).unwrap_or(
-            default_value.ok_or_else(Self::missing_default)?,
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        Ok(Self(sources.user.copied().flatten().unwrap_or(
+            sources.default.ok_or_else(Self::missing_default)?,
         )))
     }
 }
@@ -773,11 +1065,7 @@ impl Settings for VimSettings {
 
     type FileContent = VimSettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self> {
-        Self::load_via_json_merge(default_value, user_values)
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        sources.json_merge()
     }
 }

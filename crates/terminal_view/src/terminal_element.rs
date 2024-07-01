@@ -1,11 +1,11 @@
 use editor::{CursorLayout, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    div, fill, point, px, relative, AnyElement, Bounds, DispatchPhase, Element, ElementContext,
-    FocusHandle, Font, FontStyle, FontWeight, HighlightStyle, Hitbox, Hsla, InputHandler,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, Model, ModelContext,
-    ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels, Point, ShapedLine,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle, UnderlineStyle,
-    WeakView, WhiteSpace, WindowContext, WindowTextSystem,
+    div, fill, point, px, relative, size, AnyElement, AvailableSpace, Bounds, ContentMask,
+    DispatchPhase, Element, ElementId, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
+    HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement,
+    LayoutId, Model, ModelContext, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
+    Point, ShapedLine, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
+    UnderlineStyle, View, WeakView, WhiteSpace, WindowContext, WindowTextSystem,
 };
 use itertools::Itertools;
 use language::CursorShape;
@@ -24,11 +24,13 @@ use terminal::{
     HoveredWord, IndexedCell, Terminal, TerminalContent, TerminalSize,
 };
 use theme::{ActiveTheme, Theme, ThemeSettings};
-use ui::Tooltip;
+use ui::{ParentElement, Tooltip};
 use workspace::Workspace;
 
-use std::mem;
 use std::{fmt::Debug, ops::RangeInclusive};
+use std::{mem, sync::Arc};
+
+use crate::{BlockContext, BlockProperties, TerminalView};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -44,6 +46,7 @@ pub struct LayoutState {
     hyperlink_tooltip: Option<AnyElement>,
     gutter: Pixels,
     last_hovered_word: Option<HoveredWord>,
+    block_below_cursor_element: Option<AnyElement>,
 }
 
 /// Helper struct for converting data between Alacritty's cursor points, and displayed cursor points.
@@ -85,7 +88,7 @@ impl LayoutCell {
         origin: Point<Pixels>,
         layout: &LayoutState,
         _visible_bounds: Bounds<Pixels>,
-        cx: &mut ElementContext,
+        cx: &mut WindowContext,
     ) {
         let pos = {
             let point = self.point;
@@ -124,7 +127,7 @@ impl LayoutRect {
         }
     }
 
-    fn paint(&self, origin: Point<Pixels>, layout: &LayoutState, cx: &mut ElementContext) {
+    fn paint(&self, origin: Point<Pixels>, layout: &LayoutState, cx: &mut WindowContext) {
         let position = {
             let alac_point = self.point;
             point(
@@ -146,12 +149,14 @@ impl LayoutRect {
 /// We need to keep a reference to the view for mouse events, do we need it for any other terminal stuff, or can we move that to connection?
 pub struct TerminalElement {
     terminal: Model<Terminal>,
+    terminal_view: View<TerminalView>,
     workspace: WeakView<Workspace>,
     focus: FocusHandle,
     focused: bool,
     cursor_visible: bool,
     can_navigate_to_selected_word: bool,
     interactivity: Interactivity,
+    block_below_cursor: Option<Arc<BlockProperties>>,
 }
 
 impl InteractiveElement for TerminalElement {
@@ -163,21 +168,26 @@ impl InteractiveElement for TerminalElement {
 impl StatefulInteractiveElement for TerminalElement {}
 
 impl TerminalElement {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         terminal: Model<Terminal>,
+        terminal_view: View<TerminalView>,
         workspace: WeakView<Workspace>,
         focus: FocusHandle,
         focused: bool,
         cursor_visible: bool,
         can_navigate_to_selected_word: bool,
+        block_below_cursor: Option<Arc<BlockProperties>>,
     ) -> TerminalElement {
         TerminalElement {
             terminal,
+            terminal_view,
             workspace,
             focused,
             focus: focus.clone(),
             cursor_visible,
             can_navigate_to_selected_word,
+            block_below_cursor,
             interactivity: Default::default(),
         }
         .track_focus(&focus)
@@ -192,7 +202,7 @@ impl TerminalElement {
         // terminal_theme: &TerminalStyle,
         text_system: &WindowTextSystem,
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
-        cx: &WindowContext<'_>,
+        cx: &WindowContext,
     ) -> (Vec<LayoutCell>, Vec<LayoutRect>) {
         let theme = cx.theme();
         let mut cells = vec![];
@@ -418,7 +428,7 @@ impl TerminalElement {
         origin: Point<Pixels>,
         mode: TermMode,
         hitbox: &Hitbox,
-        cx: &mut ElementContext,
+        cx: &mut WindowContext,
     ) {
         let focus = self.focus.clone();
         let terminal = self.terminal.clone();
@@ -429,7 +439,7 @@ impl TerminalElement {
             move |e, cx| {
                 cx.focus(&focus);
                 terminal.update(cx, |terminal, cx| {
-                    terminal.mouse_down(&e, origin);
+                    terminal.mouse_down(&e, origin, cx);
                     cx.notify();
                 })
             }
@@ -447,14 +457,14 @@ impl TerminalElement {
                 if e.pressed_button.is_some() && !cx.has_active_drag() {
                     let hovered = hitbox.is_hovered(cx);
                     terminal.update(cx, |terminal, cx| {
-                        if !terminal.selection_started() {
+                        if terminal.selection_started() {
+                            terminal.mouse_drag(e, origin, hitbox.bounds);
+                            cx.notify();
+                        } else {
                             if hovered {
                                 terminal.mouse_drag(e, origin, hitbox.bounds);
                                 cx.notify();
                             }
-                        } else {
-                            terminal.mouse_drag(e, origin, hitbox.bounds);
-                            cx.notify();
                         }
                     })
                 }
@@ -479,13 +489,26 @@ impl TerminalElement {
                 },
             ),
         );
+        self.interactivity.on_mouse_down(
+            MouseButton::Middle,
+            TerminalElement::generic_button_handler(
+                terminal.clone(),
+                origin,
+                focus.clone(),
+                move |terminal, origin, e, cx| {
+                    terminal.mouse_down(&e, origin, cx);
+                },
+            ),
+        );
         self.interactivity.on_scroll_wheel({
-            let terminal = terminal.clone();
+            let terminal_view = self.terminal_view.downgrade();
             move |e, cx| {
-                terminal.update(cx, |terminal, cx| {
-                    terminal.scroll_wheel(e, origin);
-                    cx.notify();
-                })
+                terminal_view
+                    .update(cx, |terminal_view, cx| {
+                        terminal_view.scroll_wheel(e, origin, cx);
+                        cx.notify();
+                    })
+                    .ok();
             }
         });
 
@@ -498,19 +521,8 @@ impl TerminalElement {
                     terminal.clone(),
                     origin,
                     focus.clone(),
-                    move |terminal, origin, e, _cx| {
-                        terminal.mouse_down(&e, origin);
-                    },
-                ),
-            );
-            self.interactivity.on_mouse_down(
-                MouseButton::Middle,
-                TerminalElement::generic_button_handler(
-                    terminal.clone(),
-                    origin,
-                    focus.clone(),
-                    move |terminal, origin, e, _cx| {
-                        terminal.mouse_down(&e, origin);
+                    move |terminal, origin, e, cx| {
+                        terminal.mouse_down(&e, origin, cx);
                     },
                 ),
             );
@@ -538,32 +550,64 @@ impl TerminalElement {
             );
         }
     }
+
+    fn rem_size(&self, cx: &WindowContext) -> Option<Pixels> {
+        let settings = ThemeSettings::get_global(cx).clone();
+        let buffer_font_size = settings.buffer_font_size(cx);
+        let rem_size_scale = {
+            // Our default UI font size is 14px on a 16px base scale.
+            // This means the default UI font size is 0.875rems.
+            let default_font_size_scale = 14. / ui::BASE_REM_SIZE_IN_PX;
+
+            // We then determine the delta between a single rem and the default font
+            // size scale.
+            let default_font_size_delta = 1. - default_font_size_scale;
+
+            // Finally, we add this delta to 1rem to get the scale factor that
+            // should be used to scale up the UI.
+            1. + default_font_size_delta
+        };
+
+        Some(buffer_font_size * rem_size_scale)
+    }
 }
 
 impl Element for TerminalElement {
-    type BeforeLayout = ();
-    type AfterLayout = LayoutState;
+    type RequestLayoutState = ();
+    type PrepaintState = LayoutState;
 
-    fn before_layout(&mut self, cx: &mut ElementContext) -> (LayoutId, Self::BeforeLayout) {
-        self.interactivity.occlude_mouse();
-        let layout_id = self.interactivity.before_layout(cx, |mut style, cx| {
-            style.size.width = relative(1.).into();
-            style.size.height = relative(1.).into();
-            let layout_id = cx.request_layout(&style, None);
+    fn id(&self) -> Option<ElementId> {
+        self.interactivity.element_id.clone()
+    }
 
-            layout_id
-        });
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        cx: &mut WindowContext,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let layout_id = self
+            .interactivity
+            .request_layout(global_id, cx, |mut style, cx| {
+                style.size.width = relative(1.).into();
+                style.size.height = relative(1.).into();
+                // style.overflow = point(Overflow::Hidden, Overflow::Hidden);
+                let layout_id = cx.request_layout(style, None);
+
+                layout_id
+            });
         (layout_id, ())
     }
 
-    fn after_layout(
+    fn prepaint(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut Self::BeforeLayout,
-        cx: &mut ElementContext,
-    ) -> Self::AfterLayout {
+        _: &mut Self::RequestLayoutState,
+        cx: &mut WindowContext,
+    ) -> Self::PrepaintState {
+        let rem_size = self.rem_size(cx);
         self.interactivity
-            .after_layout(bounds, bounds.size, cx, |_, _, hitbox, cx| {
+            .prepaint(global_id, bounds, bounds.size, cx, |_, _, hitbox, cx| {
                 let hitbox = hitbox.unwrap();
                 let settings = ThemeSettings::get_global(cx).clone();
 
@@ -578,7 +622,10 @@ impl Element for TerminalElement {
 
                 let font_features = terminal_settings
                     .font_features
-                    .unwrap_or(settings.buffer_font.features);
+                    .clone()
+                    .unwrap_or(settings.buffer_font.features.clone());
+
+                let font_weight = terminal_settings.font_weight.unwrap_or_default();
 
                 let line_height = terminal_settings.line_height.value();
                 let font_size = terminal_settings.font_size;
@@ -605,6 +652,7 @@ impl Element for TerminalElement {
                 let text_style = TextStyle {
                     font_family,
                     font_features,
+                    font_weight,
                     font_size: font_size.into(),
                     font_style: FontStyle::Normal,
                     line_height: line_height.into(),
@@ -614,7 +662,6 @@ impl Element for TerminalElement {
                     underline: None,
                     strikethrough: None,
                     color: theme.colors().text,
-                    font_weight: FontWeight::NORMAL,
                 };
 
                 let text_system = cx.text_system();
@@ -662,14 +709,15 @@ impl Element for TerminalElement {
                     }
                 });
 
+                let scroll_top = self.terminal_view.read(cx).scroll_top;
                 let hyperlink_tooltip = last_hovered_word.clone().map(|hovered_word| {
-                    let offset = bounds.origin + Point::new(gutter, px(0.));
+                    let offset = bounds.origin + point(gutter, px(0.)) - point(px(0.), scroll_top);
                     let mut element = div()
                         .size_full()
                         .id("terminal-element")
                         .tooltip(move |cx| Tooltip::text(hovered_word.word.clone(), cx))
                         .into_any_element();
-                    element.layout(offset, bounds.size.into(), cx);
+                    element.prepaint_as_root(offset, bounds.size.into(), cx);
                     element
                 });
 
@@ -682,6 +730,8 @@ impl Element for TerminalElement {
                     cursor,
                     ..
                 } = &self.terminal.read(cx).last_content;
+                let mode = *mode;
+                let display_offset = *display_offset;
 
                 // searches, highlights to a single range representations
                 let mut relative_highlighted_ranges = Vec::new();
@@ -710,7 +760,7 @@ impl Element for TerminalElement {
                 let cursor = if let AlacCursorShape::Hidden = cursor.shape {
                     None
                 } else {
-                    let cursor_point = DisplayCursor::from(cursor.point, *display_offset);
+                    let cursor_point = DisplayCursor::from(cursor.point, display_offset);
                     let cursor_text = {
                         let str_trxt = cursor_char.to_string();
                         let len = str_trxt.len();
@@ -755,6 +805,37 @@ impl Element for TerminalElement {
                     )
                 };
 
+                let block_below_cursor_element = if let Some(block) = &self.block_below_cursor {
+                    let terminal = self.terminal.read(cx);
+                    if terminal.last_content.display_offset == 0 {
+                        let target_line = terminal.last_content.cursor.point.line.0 + 1;
+                        let render = &block.render;
+                        let mut block_cx = BlockContext {
+                            context: cx,
+                            dimensions,
+                        };
+                        let element = render(&mut block_cx);
+                        let mut element = div().occlude().child(element).into_any_element();
+                        let available_space = size(
+                            AvailableSpace::Definite(dimensions.width() + gutter),
+                            AvailableSpace::Definite(
+                                block.height as f32 * dimensions.line_height(),
+                            ),
+                        );
+                        let origin = bounds.origin
+                            + point(px(0.), target_line as f32 * dimensions.line_height())
+                            - point(px(0.), scroll_top);
+                        cx.with_rem_size(rem_size, |cx| {
+                            element.prepaint_as_root(origin, available_space, cx);
+                        });
+                        Some(element)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 LayoutState {
                     hitbox,
                     cells,
@@ -763,98 +844,110 @@ impl Element for TerminalElement {
                     dimensions,
                     rects,
                     relative_highlighted_ranges,
-                    mode: *mode,
-                    display_offset: *display_offset,
+                    mode,
+                    display_offset,
                     hyperlink_tooltip,
                     gutter,
                     last_hovered_word,
+                    block_below_cursor_element,
                 }
             })
     }
 
     fn paint(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut Self::BeforeLayout,
-        layout: &mut Self::AfterLayout,
-        cx: &mut ElementContext<'_>,
+        _: &mut Self::RequestLayoutState,
+        layout: &mut Self::PrepaintState,
+        cx: &mut WindowContext<'_>,
     ) {
-        cx.paint_quad(fill(bounds, layout.background_color));
-        let origin = bounds.origin + Point::new(layout.gutter, px(0.));
+        cx.with_content_mask(Some(ContentMask { bounds }), |cx| {
+            let scroll_top = self.terminal_view.read(cx).scroll_top;
 
-        let terminal_input_handler = TerminalInputHandler {
-            terminal: self.terminal.clone(),
-            cursor_bounds: layout
-                .cursor
-                .as_ref()
-                .map(|cursor| cursor.bounding_rect(origin)),
-            workspace: self.workspace.clone(),
-        };
+            cx.paint_quad(fill(bounds, layout.background_color));
+            let origin =
+                bounds.origin + Point::new(layout.gutter, px(0.)) - Point::new(px(0.), scroll_top);
 
-        self.register_mouse_listeners(origin, layout.mode, &layout.hitbox, cx);
-        if self.can_navigate_to_selected_word && layout.last_hovered_word.is_some() {
-            cx.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
-        } else {
-            cx.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
-        }
+            let terminal_input_handler = TerminalInputHandler {
+                terminal: self.terminal.clone(),
+                cursor_bounds: layout
+                    .cursor
+                    .as_ref()
+                    .map(|cursor| cursor.bounding_rect(origin)),
+                workspace: self.workspace.clone(),
+            };
 
-        let cursor = layout.cursor.take();
-        let hyperlink_tooltip = layout.hyperlink_tooltip.take();
-        self.interactivity
-            .paint(bounds, Some(&layout.hitbox), cx, |_, cx| {
-                cx.handle_input(&self.focus, terminal_input_handler);
+            self.register_mouse_listeners(origin, layout.mode, &layout.hitbox, cx);
+            if self.can_navigate_to_selected_word && layout.last_hovered_word.is_some() {
+                cx.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
+            } else {
+                cx.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
+            }
 
-                cx.on_key_event({
-                    let this = self.terminal.clone();
-                    move |event: &ModifiersChangedEvent, phase, cx| {
-                        if phase != DispatchPhase::Bubble {
-                            return;
+            let cursor = layout.cursor.take();
+            let hyperlink_tooltip = layout.hyperlink_tooltip.take();
+            let block_below_cursor_element = layout.block_below_cursor_element.take();
+            self.interactivity
+                .paint(global_id, bounds, Some(&layout.hitbox), cx, |_, cx| {
+                    cx.handle_input(&self.focus, terminal_input_handler);
+
+                    cx.on_key_event({
+                        let this = self.terminal.clone();
+                        move |event: &ModifiersChangedEvent, phase, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
+                            }
+
+                            let handled = this
+                                .update(cx, |term, _| term.try_modifiers_change(&event.modifiers));
+
+                            if handled {
+                                cx.refresh();
+                            }
                         }
+                    });
 
-                        let handled =
-                            this.update(cx, |term, _| term.try_modifiers_change(&event.modifiers));
+                    for rect in &layout.rects {
+                        rect.paint(origin, &layout, cx);
+                    }
 
-                        if handled {
-                            cx.refresh();
+                    for (relative_highlighted_range, color) in
+                        layout.relative_highlighted_ranges.iter()
+                    {
+                        if let Some((start_y, highlighted_range_lines)) =
+                            to_highlighted_range_lines(relative_highlighted_range, &layout, origin)
+                        {
+                            let hr = HighlightedRange {
+                                start_y,
+                                line_height: layout.dimensions.line_height,
+                                lines: highlighted_range_lines,
+                                color: *color,
+                                corner_radius: 0.15 * layout.dimensions.line_height,
+                            };
+                            hr.paint(bounds, cx);
                         }
+                    }
+
+                    for cell in &layout.cells {
+                        cell.paint(origin, &layout, bounds, cx);
+                    }
+
+                    if self.cursor_visible {
+                        if let Some(mut cursor) = cursor {
+                            cursor.paint(origin, cx);
+                        }
+                    }
+
+                    if let Some(mut element) = block_below_cursor_element {
+                        element.paint(cx);
+                    }
+
+                    if let Some(mut element) = hyperlink_tooltip {
+                        element.paint(cx);
                     }
                 });
-
-                for rect in &layout.rects {
-                    rect.paint(origin, &layout, cx);
-                }
-
-                for (relative_highlighted_range, color) in layout.relative_highlighted_ranges.iter()
-                {
-                    if let Some((start_y, highlighted_range_lines)) =
-                        to_highlighted_range_lines(relative_highlighted_range, &layout, origin)
-                    {
-                        let hr = HighlightedRange {
-                            start_y, //Need to change this
-                            line_height: layout.dimensions.line_height,
-                            lines: highlighted_range_lines,
-                            color: *color,
-                            //Copied from editor. TODO: move to theme or something
-                            corner_radius: 0.15 * layout.dimensions.line_height,
-                        };
-                        hr.paint(bounds, cx);
-                    }
-                }
-
-                for cell in &layout.cells {
-                    cell.paint(origin, &layout, bounds, cx);
-                }
-
-                if self.cursor_visible {
-                    if let Some(mut cursor) = cursor {
-                        cursor.paint(origin, cx);
-                    }
-                }
-
-                if let Some(mut element) = hyperlink_tooltip {
-                    element.paint(cx);
-                }
-            });
+        });
     }
 }
 
@@ -937,7 +1030,7 @@ impl InputHandler for TerminalInputHandler {
     }
 }
 
-fn is_blank(cell: &IndexedCell) -> bool {
+pub fn is_blank(cell: &IndexedCell) -> bool {
     if cell.c != ' ' {
         return false;
     }
@@ -1027,7 +1120,7 @@ fn to_highlighted_range_lines(
 }
 
 /// Converts a 2, 8, or 24 bit color ANSI color to the GPUI equivalent.
-fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme: &Theme) -> Hsla {
+pub fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme: &Theme) -> Hsla {
     let colors = theme.colors();
     match fg {
         // Named and theme defined colors

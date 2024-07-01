@@ -1,6 +1,6 @@
 use gpui::{AnyView, DefiniteLength};
 
-use crate::{prelude::*, SelectableButton};
+use crate::{prelude::*, ElevationIndex, SelectableButton, Spacing};
 use crate::{ButtonCommon, ButtonLike, ButtonSize, ButtonStyle, IconName, IconSize};
 
 use super::button_icon::ButtonIcon;
@@ -86,6 +86,11 @@ impl Clickable for IconButton {
         self.base = self.base.on_click(handler);
         self
     }
+
+    fn cursor_style(mut self, cursor_style: gpui::CursorStyle) -> Self {
+        self.base = self.base.cursor_style(cursor_style);
+        self
+    }
 }
 
 impl FixedWidth for IconButton {
@@ -119,6 +124,11 @@ impl ButtonCommon for IconButton {
         self.base = self.base.tooltip(tooltip);
         self
     }
+
+    fn layer(mut self, elevation: ElevationIndex) -> Self {
+        self.base = self.base.layer(elevation);
+        self
+    }
 }
 
 impl VisibleOnHover for IconButton {
@@ -139,10 +149,10 @@ impl RenderOnce for IconButton {
                 IconButtonShape::Square => {
                     let icon_size = self.icon_size.rems() * cx.rem_size();
                     let padding = match self.icon_size {
-                        IconSize::Indicator => px(0.),
-                        IconSize::XSmall => px(0.),
-                        IconSize::Small => px(2.),
-                        IconSize::Medium => px(2.),
+                        IconSize::Indicator => Spacing::None.px(cx),
+                        IconSize::XSmall => Spacing::XSmall.px(cx),
+                        IconSize::Small => Spacing::XSmall.px(cx),
+                        IconSize::Medium => Spacing::XSmall.px(cx),
                     };
 
                     this.width((icon_size + padding * 2.).into())

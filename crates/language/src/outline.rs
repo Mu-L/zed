@@ -1,6 +1,11 @@
 use fuzzy::{StringMatch, StringMatchCandidate};
-use gpui::{BackgroundExecutor, HighlightStyle};
+use gpui::{
+    relative, AppContext, BackgroundExecutor, FontStyle, HighlightStyle, StyledText, TextStyle,
+    WhiteSpace,
+};
+use settings::Settings;
 use std::ops::Range;
+use theme::{ActiveTheme, ThemeSettings};
 
 /// An outline of all the symbols contained in a buffer.
 #[derive(Debug)]
@@ -11,7 +16,7 @@ pub struct Outline<T> {
     path_candidate_prefixes: Vec<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OutlineItem<T> {
     pub depth: usize,
     pub range: Range<T>,
@@ -82,7 +87,7 @@ impl<T> Outline<T> {
         let mut prev_item_ix = 0;
         for mut string_match in matches {
             let outline_match = &self.items[string_match.candidate_id];
-            string_match.string = outline_match.text.clone();
+            string_match.string.clone_from(&outline_match.text);
 
             if is_path_query {
                 let prefix_len = self.path_candidate_prefixes[string_match.candidate_id];
@@ -137,4 +142,35 @@ impl<T> Outline<T> {
 
         tree_matches
     }
+}
+
+pub fn render_item<T>(
+    outline_item: &OutlineItem<T>,
+    custom_highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
+    cx: &AppContext,
+) -> StyledText {
+    let settings = ThemeSettings::get_global(cx);
+
+    // TODO: We probably shouldn't need to build a whole new text style here
+    // but I'm not sure how to get the current one and modify it.
+    // Before this change TextStyle::default() was used here, which was giving us the wrong font and text color.
+    let text_style = TextStyle {
+        color: cx.theme().colors().text,
+        font_family: settings.buffer_font.family.clone(),
+        font_features: settings.buffer_font.features.clone(),
+        font_size: settings.buffer_font_size(cx).into(),
+        font_weight: settings.buffer_font.weight,
+        font_style: FontStyle::Normal,
+        line_height: relative(1.),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+        white_space: WhiteSpace::Normal,
+    };
+    let highlights = gpui::combine_highlights(
+        custom_highlights,
+        outline_item.highlight_ranges.iter().cloned(),
+    );
+
+    StyledText::new(outline_item.text.clone()).with_highlights(&text_style, highlights)
 }

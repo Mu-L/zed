@@ -267,7 +267,7 @@ impl Room {
                 .await
             {
                 Ok(()) => Ok(room),
-                Err(error) => Err(anyhow!("room creation failed: {:?}", error)),
+                Err(error) => Err(error.context("room creation failed")),
             }
         })
     }
@@ -697,7 +697,6 @@ impl Room {
     async fn handle_room_updated(
         this: Model<Self>,
         envelope: TypedEnvelope<proto::RoomUpdated>,
-        _: Arc<Client>,
         mut cx: AsyncAppContext,
     ) -> Result<()> {
         let room = envelope
@@ -1182,7 +1181,7 @@ impl Room {
         cx.emit(Event::RemoteProjectJoined { project_id: id });
         cx.spawn(move |this, mut cx| async move {
             let project =
-                Project::remote(id, client, user_store, language_registry, fs, cx.clone()).await?;
+                Project::in_room(id, client, user_store, language_registry, fs, cx.clone()).await?;
 
             this.update(&mut cx, |this, cx| {
                 this.joined_projects.retain(|project| {
@@ -1203,14 +1202,25 @@ impl Room {
         project: Model<Project>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<u64>> {
-        if let Some(project_id) = project.read(cx).remote_id() {
-            return Task::ready(Ok(project_id));
-        }
+        let request = if let Some(dev_server_project_id) = project.read(cx).dev_server_project_id()
+        {
+            self.client.request(proto::ShareProject {
+                room_id: self.id(),
+                worktrees: vec![],
+                dev_server_project_id: Some(dev_server_project_id.0),
+            })
+        } else {
+            if let Some(project_id) = project.read(cx).remote_id() {
+                return Task::ready(Ok(project_id));
+            }
 
-        let request = self.client.request(proto::ShareProject {
-            room_id: self.id(),
-            worktrees: project.read(cx).worktree_metadata_protos(cx),
-        });
+            self.client.request(proto::ShareProject {
+                room_id: self.id(),
+                worktrees: project.read(cx).worktree_metadata_protos(cx),
+                dev_server_project_id: None,
+            })
+        };
+
         cx.spawn(|this, mut cx| async move {
             let response = request.await?;
 

@@ -17,12 +17,23 @@ OPTIONS
   --stable         Use stable Zed release installed on local machine for all instances (except for the first one).
 `.trim();
 
-const { spawn, execFileSync } = require("child_process");
+const { spawn, execSync, execFileSync } = require("child_process");
 const assert = require("assert");
 
-const users = require(
-  process.env.SEED_PATH || "../crates/collab/seed.default.json",
-).admins;
+let users;
+if (process.env.SEED_PATH) {
+  users = require(process.env.SEED_PATH).admins;
+} else {
+  users = require("../crates/collab/seed.default.json").admins;
+  try {
+    const defaultUsers = users;
+    const customUsers = require("../crates/collab/seed.json").admins;
+    assert(customUsers.length > 0);
+    users = customUsers.concat(
+      defaultUsers.filter((user) => !customUsers.includes(user)),
+    );
+  } catch (_) {}
+}
 
 const RESOLUTION_REGEX = /(\d+) x (\d+)/;
 const DIGIT_FLAG_REGEX = /^--?(\d+)$/;
@@ -31,6 +42,7 @@ let instanceCount = 1;
 let isReleaseMode = false;
 let isTop = false;
 let othersOnStable = false;
+let isStateful = false;
 
 const args = process.argv.slice(2);
 while (args.length > 0) {
@@ -41,6 +53,8 @@ while (args.length > 0) {
     instanceCount = parseInt(digitMatch[1]);
   } else if (arg === "--release") {
     isReleaseMode = true;
+  } else if (arg == "--stateful") {
+    isStateful = true;
   } else if (arg === "--top") {
     isTop = true;
   } else if (arg === "--help") {
@@ -54,23 +68,43 @@ while (args.length > 0) {
 
   args.shift();
 }
+const os = require("os");
+const platform = os.platform();
 
-// Parse the resolution of the main screen
-const displayInfo = JSON.parse(
-  execFileSync("system_profiler", ["SPDisplaysDataType", "-json"], {
-    encoding: "utf8",
-  }),
-);
-const mainDisplayResolution =
-  displayInfo?.SPDisplaysDataType[0]?.spdisplays_ndrvs
-    ?.find((entry) => entry.spdisplays_main === "spdisplays_yes")
-    ?._spdisplays_resolution?.match(RESOLUTION_REGEX);
-if (!mainDisplayResolution) {
-  throw new Error("Could not parse screen resolution");
-}
+let screenWidth, screenHeight;
 const titleBarHeight = 24;
-const screenWidth = parseInt(mainDisplayResolution[1]);
-let screenHeight = parseInt(mainDisplayResolution[2]) - titleBarHeight;
+
+if (platform === "darwin") {
+  // macOS
+  const displayInfo = JSON.parse(
+    execFileSync("system_profiler", ["SPDisplaysDataType", "-json"], {
+      encoding: "utf8",
+    }),
+  );
+  const mainDisplayResolution = displayInfo?.SPDisplaysDataType?.flatMap(
+    (display) => display?.spdisplays_ndrvs,
+  )
+    ?.find((entry) => entry?.spdisplays_main === "spdisplays_yes")
+    ?._spdisplays_resolution?.match(RESOLUTION_REGEX);
+  if (!mainDisplayResolution) {
+    throw new Error("Could not parse screen resolution");
+  }
+  screenWidth = parseInt(mainDisplayResolution[1]);
+  screenHeight = parseInt(mainDisplayResolution[2]) - titleBarHeight;
+} else if (platform === "linux") {
+  // Linux
+  try {
+    const xrandrOutput = execSync('xrandr | grep "\\*" | cut -d" " -f4', {
+      encoding: "utf8",
+    }).trim();
+    [screenWidth, screenHeight] = xrandrOutput.split("x").map(Number);
+  } catch (err) {
+    console.log(err);
+    throw new Error("Could not get screen resolution");
+  }
+}
+
+screenHeight -= titleBarHeight;
 
 if (isTop) {
   screenHeight = Math.floor(screenHeight / 2);
@@ -106,14 +140,16 @@ if (user) {
 }
 
 let buildArgs = ["build"];
-let zedBinary = "target/debug/Zed";
+let zedBinary = "target/debug/zed";
 if (isReleaseMode) {
   buildArgs.push("--release");
-  zedBinary = "target/release/Zed";
+  zedBinary = "target/release/zed";
 }
 
 try {
-  execFileSync("cargo", buildArgs, { stdio: "inherit" });
+  execFileSync("cargo", buildArgs, {
+    stdio: "inherit",
+  });
 } catch (e) {
   process.exit(0);
 }
@@ -133,19 +169,18 @@ setTimeout(() => {
     }
     spawn(binaryPath, i == 0 ? args : [], {
       stdio: "inherit",
-      env: {
+      env: Object.assign({}, process.env, {
         ZED_IMPERSONATE: users[i],
         ZED_WINDOW_POSITION: position,
-        ZED_STATELESS: "1",
+        ZED_STATELESS: isStateful && i == 0 ? "" : "1",
         ZED_ALWAYS_ACTIVE: "1",
         ZED_SERVER_URL: "http://localhost:3000",
         ZED_RPC_URL: "http://localhost:8080/rpc",
         ZED_ADMIN_API_TOKEN: "secret",
         ZED_WINDOW_SIZE: size,
         ZED_CLIENT_CHECKSUM_SEED: "development-checksum-seed",
-        PATH: process.env.PATH,
         RUST_LOG: process.env.RUST_LOG || "info",
-      },
+      }),
     });
   }
 }, 0.1);

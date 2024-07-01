@@ -1,17 +1,33 @@
+//! The Zed Rust Extension API allows you write extensions for [Zed](https://zed.dev/) in Rust.
+
+/// Provides access to Zed settings.
+pub mod settings;
+
 use core::fmt;
 
 use wit::*;
+
+pub use serde_json;
 
 // WIT re-exports.
 //
 // We explicitly enumerate the symbols we want to re-export, as there are some
 // that we may want to shadow to provide a cleaner Rust API.
 pub use wit::{
-    current_platform, download_file, latest_github_release, make_file_executable, node_binary_path,
-    npm_install_package, npm_package_installed_version, npm_package_latest_version,
-    zed::extension::lsp, Architecture, CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command,
-    DownloadedFileType, EnvVars, GithubRelease, GithubReleaseAsset, GithubReleaseOptions,
-    LanguageServerInstallationStatus, Os, Range, Worktree,
+    download_file, make_file_executable,
+    zed::extension::github::{
+        github_release_by_tag_name, latest_github_release, GithubRelease, GithubReleaseAsset,
+        GithubReleaseOptions,
+    },
+    zed::extension::http_client::{fetch, HttpRequest, HttpResponse},
+    zed::extension::nodejs::{
+        node_binary_path, npm_install_package, npm_package_installed_version,
+        npm_package_latest_version,
+    },
+    zed::extension::platform::{current_platform, Architecture, Os},
+    zed::extension::slash_command::{SlashCommand, SlashCommandOutput, SlashCommandOutputSection},
+    CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command, DownloadedFileType, EnvVars,
+    LanguageServerInstallationStatus, Range, Worktree,
 };
 
 // Undocumented WIT re-exports.
@@ -20,6 +36,14 @@ pub use wit::{
 // the extension host, but aren't relevant to extension authors.
 #[doc(hidden)]
 pub use wit::Guest;
+
+/// Constructs for interacting with language servers over the
+/// Language Server Protocol (LSP).
+pub mod lsp {
+    pub use crate::wit::zed::extension::lsp::{
+        Completion, CompletionKind, InsertTextFormat, Symbol, SymbolKind,
+    };
+}
 
 /// A result returned from a Zed extension.
 pub type Result<T, E = String> = core::result::Result<T, E>;
@@ -43,16 +67,27 @@ pub trait Extension: Send + Sync {
     /// language.
     fn language_server_command(
         &mut self,
-        language_server_id: &LanguageServerId,
-        worktree: &Worktree,
-    ) -> Result<Command>;
+        _language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
+    ) -> Result<Command> {
+        Err("`language_server_command` not implemented".to_string())
+    }
 
     /// Returns the initialization options to pass to the specified language server.
     fn language_server_initialization_options(
         &mut self,
         _language_server_id: &LanguageServerId,
         _worktree: &Worktree,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    /// Returns the workspace configuration options to pass to the language server.
+    fn language_server_workspace_configuration(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
+    ) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
 
@@ -73,8 +108,30 @@ pub trait Extension: Send + Sync {
     ) -> Option<CodeLabel> {
         None
     }
+
+    /// Returns the completions that should be shown when completing the provided slash command with the given query.
+    fn complete_slash_command_argument(
+        &self,
+        _command: SlashCommand,
+        _query: String,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Returns the output from running the provided slash command.
+    fn run_slash_command(
+        &self,
+        _command: SlashCommand,
+        _argument: Option<String>,
+        _worktree: &Worktree,
+    ) -> Result<SlashCommandOutput, String> {
+        Err("`run_slash_command` not implemented".to_string())
+    }
 }
 
+/// Registers the provided type as a Zed extension.
+///
+/// The type must implement the [`Extension`] trait.
 #[macro_export]
 macro_rules! register_extension {
     ($extension_type:ty) => {
@@ -105,9 +162,11 @@ static mut EXTENSION: Option<Box<dyn Extension>> = None;
 pub static ZED_API_VERSION: [u8; 6] = *include_bytes!(concat!(env!("OUT_DIR"), "/version_bytes"));
 
 mod wit {
+    #![allow(clippy::too_many_arguments)]
+
     wit_bindgen::generate!({
         skip: ["init-extension"],
-        path: "./wit/since_v0.0.6",
+        path: "./wit/since_v0.0.7",
     });
 }
 
@@ -129,7 +188,19 @@ impl wit::Guest for Component {
         worktree: &Worktree,
     ) -> Result<Option<String>, String> {
         let language_server_id = LanguageServerId(language_server_id);
-        extension().language_server_initialization_options(&language_server_id, worktree)
+        Ok(extension()
+            .language_server_initialization_options(&language_server_id, worktree)?
+            .and_then(|value| serde_json::to_string(&value).ok()))
+    }
+
+    fn language_server_workspace_configuration(
+        language_server_id: String,
+        worktree: &Worktree,
+    ) -> Result<Option<String>, String> {
+        let language_server_id = LanguageServerId(language_server_id);
+        Ok(extension()
+            .language_server_workspace_configuration(&language_server_id, worktree)?
+            .and_then(|value| serde_json::to_string(&value).ok()))
     }
 
     fn labels_for_completions(
@@ -163,8 +234,24 @@ impl wit::Guest for Component {
         }
         Ok(labels)
     }
+
+    fn complete_slash_command_argument(
+        command: SlashCommand,
+        query: String,
+    ) -> Result<Vec<String>, String> {
+        extension().complete_slash_command_argument(command, query)
+    }
+
+    fn run_slash_command(
+        command: SlashCommand,
+        argument: Option<String>,
+        worktree: &Worktree,
+    ) -> Result<SlashCommandOutput, String> {
+        extension().run_slash_command(command, argument, worktree)
+    }
 }
 
+/// The ID of a language server.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 pub struct LanguageServerId(String);
 

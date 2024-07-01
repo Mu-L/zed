@@ -1,4 +1,7 @@
+mod copilot_completion_provider;
 pub mod request;
+mod sign_in;
+
 use anyhow::{anyhow, Context as _, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
@@ -9,10 +12,12 @@ use gpui::{
     actions, AppContext, AsyncAppContext, Context, Entity, EntityId, EventEmitter, Global, Model,
     ModelContext, Task, WeakModel,
 };
+use http::github::latest_github_release;
+use http::HttpClient;
 use language::{
-    language_settings::{all_language_settings, language_settings},
-    point_from_lsp, point_to_lsp, Anchor, Bias, Buffer, BufferSnapshot, Language,
-    LanguageServerName, PointUtf16, ToPointUtf16,
+    language_settings::{all_language_settings, language_settings, InlineCompletionProvider},
+    point_from_lsp, point_to_lsp, Anchor, Bias, Buffer, BufferSnapshot, Language, PointUtf16,
+    ToPointUtf16,
 };
 use lsp::{LanguageServer, LanguageServerBinary, LanguageServerId};
 use node_runtime::NodeRuntime;
@@ -28,9 +33,10 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::{
-    fs::remove_matching, github::latest_github_release, http::HttpClient, maybe, paths, ResultExt,
-};
+use util::{fs::remove_matching, maybe, ResultExt};
+
+pub use copilot_completion_provider::CopilotCompletionProvider;
+pub use sign_in::CopilotCodeVerification;
 
 actions!(
     copilot,
@@ -144,7 +150,6 @@ impl CopilotServer {
 }
 
 struct RunningCopilotServer {
-    name: LanguageServerName,
     lsp: Arc<LanguageServer>,
     sign_in_status: SignInStatus,
     registered_buffers: HashMap<EntityId, RegisteredBuffer>,
@@ -354,7 +359,9 @@ impl Copilot {
         let server_id = self.server_id;
         let http = self.http.clone();
         let node_runtime = self.node_runtime.clone();
-        if all_language_settings(None, cx).copilot_enabled(None, None) {
+        if all_language_settings(None, cx).inline_completions.provider
+            == InlineCompletionProvider::Copilot
+        {
             if matches!(self.server, CopilotServer::Disabled) {
                 let start_task = cx
                     .spawn(move |this, cx| {
@@ -386,14 +393,13 @@ impl Copilot {
             Default::default(),
             cx.to_async(),
         );
-        let http = util::http::FakeHttpClient::create(|_| async { unreachable!() });
+        let http = http::FakeHttpClient::create(|_| async { unreachable!() });
         let node_runtime = FakeNodeRuntime::new();
         let this = cx.new_model(|cx| Self {
             server_id: LanguageServerId(0),
             http: http.clone(),
             node_runtime,
             server: CopilotServer::Running(RunningCopilotServer {
-                name: LanguageServerName(Arc::from("copilot")),
                 lsp: Arc::new(server),
                 sign_in_status: SignInStatus::Authorized,
                 registered_buffers: Default::default(),
@@ -423,11 +429,17 @@ impl Copilot {
                     env: None,
                 };
 
+                let root_path = if cfg!(target_os = "windows") {
+                    Path::new("C:/")
+                } else {
+                    Path::new("/")
+                };
+
                 let server = LanguageServer::new(
                     Arc::new(Mutex::new(None)),
                     new_server_id,
                     binary,
-                    Path::new("/"),
+                    root_path,
                     None,
                     cx.clone(),
                 )?;
@@ -467,7 +479,6 @@ impl Copilot {
                 match server {
                     Ok((server, status)) => {
                         this.server = CopilotServer::Running(RunningCopilotServer {
-                            name: LanguageServerName(Arc::from("copilot")),
                             lsp: server,
                             sign_in_status: SignInStatus::SignedOut,
                             registered_buffers: Default::default(),
@@ -607,9 +618,9 @@ impl Copilot {
         cx.background_executor().spawn(start_task)
     }
 
-    pub fn language_server(&self) -> Option<(&LanguageServerName, &Arc<LanguageServer>)> {
+    pub fn language_server(&self) -> Option<&Arc<LanguageServer>> {
         if let CopilotServer::Running(server) = &self.server {
-            Some((&server.name, &server.lsp))
+            Some(&server.lsp)
         } else {
             None
         }
@@ -943,12 +954,9 @@ impl Copilot {
 }
 
 fn id_for_language(language: Option<&Arc<Language>>) -> String {
-    let language_name = language.map(|language| language.name());
-    match language_name.as_deref() {
-        Some("Plain Text") => "plaintext".to_string(),
-        Some(language_name) => language_name.to_lowercase(),
-        None => "plaintext".to_string(),
-    }
+    language
+        .map(|language| language.lsp_id())
+        .unwrap_or_else(|| "plaintext".to_string())
 }
 
 fn uri_for_buffer(buffer: &Model<Buffer>, cx: &AppContext) -> lsp::Url {
@@ -960,7 +968,7 @@ fn uri_for_buffer(buffer: &Model<Buffer>, cx: &AppContext) -> lsp::Url {
 }
 
 async fn clear_copilot_dir() {
-    remove_matching(&paths::COPILOT_DIR, |_| true).await
+    remove_matching(paths::copilot_dir(), |_| true).await
 }
 
 async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
@@ -971,7 +979,7 @@ async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
         let release =
             latest_github_release("zed-industries/copilot", true, false, http.clone()).await?;
 
-        let version_dir = &*paths::COPILOT_DIR.join(format!("copilot-{}", release.tag_name));
+        let version_dir = &paths::copilot_dir().join(format!("copilot-{}", release.tag_name));
 
         fs::create_dir_all(version_dir).await?;
         let server_path = version_dir.join(SERVER_PATH);
@@ -995,7 +1003,7 @@ async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
             let archive = Archive::new(decompressed_bytes);
             archive.unpack(dist_dir).await?;
 
-            remove_matching(&paths::COPILOT_DIR, |entry| entry != version_dir).await;
+            remove_matching(paths::copilot_dir(), |entry| entry != version_dir).await;
         }
 
         Ok(server_path)
@@ -1008,7 +1016,7 @@ async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
             // Fetch a cached binary, if it exists
             maybe!(async {
                 let mut last_version_dir = None;
-                let mut entries = fs::read_dir(paths::COPILOT_DIR.as_path()).await?;
+                let mut entries = fs::read_dir(paths::copilot_dir()).await?;
                 while let Some(entry) = entries.next().await {
                     let entry = entry?;
                     if entry.file_type().await?.is_dir() {
@@ -1036,15 +1044,12 @@ async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use language::BufferId;
 
     #[gpui::test(iterations = 10)]
     async fn test_buffer_management(cx: &mut TestAppContext) {
         let (copilot, mut lsp) = Copilot::fake(cx);
 
-        let buffer_1 = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(cx.entity_id().as_u64()).unwrap(), "Hello")
-        });
+        let buffer_1 = cx.new_model(|cx| Buffer::local("Hello", cx));
         let buffer_1_uri: lsp::Url = format!("buffer://{}", buffer_1.entity_id().as_u64())
             .parse()
             .unwrap();
@@ -1062,13 +1067,7 @@ mod tests {
             }
         );
 
-        let buffer_2 = cx.new_model(|cx| {
-            Buffer::new(
-                0,
-                BufferId::new(cx.entity_id().as_u64()).unwrap(),
-                "Goodbye",
-            )
-        });
+        let buffer_2 = cx.new_model(|cx| Buffer::local("Goodbye", cx));
         let buffer_2_uri: lsp::Url = format!("buffer://{}", buffer_2.entity_id().as_u64())
             .parse()
             .unwrap();
@@ -1256,18 +1255,6 @@ mod tests {
         }
 
         fn load(&self, _: &AppContext) -> Task<Result<String>> {
-            unimplemented!()
-        }
-
-        fn buffer_reloaded(
-            &self,
-            _: BufferId,
-            _: &clock::Global,
-            _: language::RopeFingerprint,
-            _: language::LineEnding,
-            _: Option<std::time::SystemTime>,
-            _: &mut AppContext,
-        ) {
             unimplemented!()
         }
     }

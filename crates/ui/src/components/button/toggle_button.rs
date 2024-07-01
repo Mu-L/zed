@@ -1,6 +1,6 @@
 use gpui::{AnyView, ClickEvent};
 
-use crate::{prelude::*, ButtonLike, ButtonLikeRounding};
+use crate::{prelude::*, ButtonLike, ButtonLikeRounding, ElevationIndex};
 
 /// The position of a [`ToggleButton`] within a group of buttons.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -82,6 +82,11 @@ impl Clickable for ToggleButton {
         self.base = self.base.on_click(handler);
         self
     }
+
+    fn cursor_style(mut self, cursor_style: gpui::CursorStyle) -> Self {
+        self.base = self.base.cursor_style(cursor_style);
+        self
+    }
 }
 
 impl ButtonCommon for ToggleButton {
@@ -101,6 +106,11 @@ impl ButtonCommon for ToggleButton {
 
     fn tooltip(mut self, tooltip: impl Fn(&mut WindowContext) -> AnyView + 'static) -> Self {
         self.base = self.base.tooltip(tooltip);
+        self
+    }
+
+    fn layer(mut self, elevation: ElevationIndex) -> Self {
+        self.base = self.base.layer(elevation);
         self
     }
 }

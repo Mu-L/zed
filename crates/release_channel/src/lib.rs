@@ -2,12 +2,13 @@
 
 #![deny(missing_docs)]
 
-use std::env;
+use std::{env, str::FromStr};
 
 use gpui::{AppContext, Global, SemanticVersion};
 use once_cell::sync::Lazy;
 
-static RELEASE_CHANNEL_NAME: Lazy<String> = if cfg!(debug_assertions) {
+/// stable | dev | nightly | preview
+pub static RELEASE_CHANNEL_NAME: Lazy<String> = if cfg!(debug_assertions) {
     Lazy::new(|| {
         env::var("ZED_RELEASE_CHANNEL")
             .unwrap_or_else(|_| include_str!("../../zed/RELEASE_CHANNEL").trim().to_string())
@@ -18,11 +19,8 @@ static RELEASE_CHANNEL_NAME: Lazy<String> = if cfg!(debug_assertions) {
 
 #[doc(hidden)]
 pub static RELEASE_CHANNEL: Lazy<ReleaseChannel> =
-    Lazy::new(|| match RELEASE_CHANNEL_NAME.as_str() {
-        "dev" => ReleaseChannel::Dev,
-        "nightly" => ReleaseChannel::Nightly,
-        "preview" => ReleaseChannel::Preview,
-        "stable" => ReleaseChannel::Stable,
+    Lazy::new(|| match ReleaseChannel::from_str(&RELEASE_CHANNEL_NAME) {
+        Ok(channel) => channel,
         _ => panic!("invalid release channel {}", *RELEASE_CHANNEL_NAME),
     });
 
@@ -61,20 +59,21 @@ impl AppVersion {
     /// 1. the `ZED_APP_VERSION` environment variable,
     /// 2. the [`AppContext::app_metadata`],
     /// 3. the passed in `pkg_version`.
-    pub fn init(pkg_version: &str, cx: &mut AppContext) {
-        let version = if let Ok(from_env) = env::var("ZED_APP_VERSION") {
+    pub fn init(pkg_version: &str) -> SemanticVersion {
+        if let Ok(from_env) = env::var("ZED_APP_VERSION") {
             from_env.parse().expect("invalid ZED_APP_VERSION")
         } else {
-            cx.app_metadata()
-                .app_version
-                .unwrap_or_else(|| pkg_version.parse().expect("invalid version in Cargo.toml"))
-        };
-        cx.set_global(GlobalAppVersion(version))
+            pkg_version.parse().expect("invalid version in Cargo.toml")
+        }
     }
 
     /// Returns the global version number.
     pub fn global(cx: &AppContext) -> SemanticVersion {
-        cx.global::<GlobalAppVersion>().0
+        if cx.has_global::<GlobalAppVersion>() {
+            cx.global::<GlobalAppVersion>().0
+        } else {
+            SemanticVersion::default()
+        }
     }
 }
 
@@ -102,8 +101,8 @@ struct GlobalReleaseChannel(ReleaseChannel);
 impl Global for GlobalReleaseChannel {}
 
 /// Initializes the release channel.
-pub fn init(pkg_version: &str, cx: &mut AppContext) {
-    AppVersion::init(pkg_version, cx);
+pub fn init(app_version: SemanticVersion, cx: &mut AppContext) {
+    cx.set_global(GlobalAppVersion(app_version));
     cx.set_global(GlobalReleaseChannel(*RELEASE_CHANNEL))
 }
 
@@ -117,6 +116,14 @@ impl ReleaseChannel {
     pub fn try_global(cx: &AppContext) -> Option<Self> {
         cx.try_global::<GlobalReleaseChannel>()
             .map(|channel| channel.0)
+    }
+
+    /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
+    pub fn poll_for_updates(&self) -> bool {
+        match self {
+            ReleaseChannel::Dev => false,
+            _ => true,
+        }
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
@@ -139,6 +146,18 @@ impl ReleaseChannel {
         }
     }
 
+    /// Returns the application ID that's used by Wayland as application ID
+    /// and WM_CLASS on X11.
+    /// This also has to match the bundle identifier for Zed on macOS.
+    pub fn app_id(&self) -> &'static str {
+        match self {
+            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
+            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
+            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
+            ReleaseChannel::Stable => "dev.zed.Zed",
+        }
+    }
+
     /// Returns the query parameter for this [`ReleaseChannel`].
     pub fn release_query_param(&self) -> Option<&'static str> {
         match self {
@@ -147,5 +166,23 @@ impl ReleaseChannel {
             Self::Preview => Some("preview=1"),
             Self::Stable => None,
         }
+    }
+}
+
+/// Error indicating that release channel string does not match any known release channel names.
+#[derive(Copy, Clone, Debug, Hash, PartialEq)]
+pub struct InvalidReleaseChannel;
+
+impl FromStr for ReleaseChannel {
+    type Err = InvalidReleaseChannel;
+
+    fn from_str(channel: &str) -> Result<Self, Self::Err> {
+        Ok(match channel {
+            "dev" => ReleaseChannel::Dev,
+            "nightly" => ReleaseChannel::Nightly,
+            "preview" => ReleaseChannel::Preview,
+            "stable" => ReleaseChannel::Stable,
+            _ => return Err(InvalidReleaseChannel),
+        })
     }
 }

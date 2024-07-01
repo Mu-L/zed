@@ -4,7 +4,7 @@ use anyhow::Result;
 use derive_more::{Deref, DerefMut};
 use gpui::{
     px, AppContext, Font, FontFeatures, FontStyle, FontWeight, Global, Pixels, Subscription,
-    ViewContext,
+    ViewContext, WindowContext,
 };
 use refineable::Refineable;
 use schemars::{
@@ -14,12 +14,71 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use settings::{Settings, SettingsJsonSchemaParams};
+use settings::{Settings, SettingsJsonSchemaParams, SettingsSources};
 use std::sync::Arc;
 use util::ResultExt as _;
 
 const MIN_FONT_SIZE: Pixels = px(6.0);
 const MIN_LINE_HEIGHT: f32 = 1.0;
+
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    /// A denser UI with tighter spacing and smaller elements.
+    #[serde(alias = "compact")]
+    Compact,
+    #[default]
+    #[serde(alias = "default")]
+    /// The default UI density.
+    Default,
+    #[serde(alias = "comfortable")]
+    /// A looser UI with more spacing and larger elements.
+    Comfortable,
+}
+
+impl UiDensity {
+    pub fn spacing_ratio(self) -> f32 {
+        match self {
+            UiDensity::Compact => 0.75,
+            UiDensity::Default => 1.0,
+            UiDensity::Comfortable => 1.25,
+        }
+    }
+}
+
+impl From<String> for UiDensity {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "compact" => Self::Compact,
+            "default" => Self::Default,
+            "comfortable" => Self::Comfortable,
+            _ => Self::default(),
+        }
+    }
+}
+
+impl Into<String> for UiDensity {
+    fn into(self) -> String {
+        match self {
+            UiDensity::Compact => "compact".to_string(),
+            UiDensity::Default => "default".to_string(),
+            UiDensity::Comfortable => "comfortable".to_string(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ThemeSettings {
@@ -31,6 +90,7 @@ pub struct ThemeSettings {
     pub theme_selection: Option<ThemeSelection>,
     pub active_theme: Arc<Theme>,
     pub theme_overrides: Option<ThemeStyleContent>,
+    pub ui_density: UiDensity,
 }
 
 impl ThemeSettings {
@@ -107,6 +167,11 @@ pub(crate) struct AdjustedBufferFontSize(Pixels);
 
 impl Global for AdjustedBufferFontSize {}
 
+#[derive(Default)]
+pub(crate) struct AdjustedUiFontSize(Pixels);
+
+impl Global for AdjustedUiFontSize {}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ThemeSelection {
@@ -167,12 +232,18 @@ pub struct ThemeSettingsContent {
     /// The OpenType features to enable for text in the UI.
     #[serde(default)]
     pub ui_font_features: Option<FontFeatures>,
+    /// The weight of the UI font in CSS units from 100 to 900.
+    #[serde(default)]
+    pub ui_font_weight: Option<f32>,
     /// The name of a font to use for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_family: Option<String>,
     /// The default font size for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_size: Option<f32>,
+    /// The weight of the editor font in CSS units from 100 to 900.
+    #[serde(default)]
+    pub buffer_font_weight: Option<f32>,
     /// The buffer's line height.
     #[serde(default)]
     pub buffer_line_height: Option<BufferLineHeight>,
@@ -182,6 +253,12 @@ pub struct ThemeSettingsContent {
     /// The name of the Zed theme to use.
     #[serde(default)]
     pub theme: Option<ThemeSelection>,
+
+    /// UNSTABLE: Expect many elements to be broken.
+    ///
+    // Controls the density of the UI.
+    #[serde(rename = "unstable.ui_density", default)]
+    pub ui_density: Option<UiDensity>,
 
     /// EXPERIMENTAL: Overrides for the current theme.
     ///
@@ -259,15 +336,9 @@ impl ThemeSettings {
                 .status
                 .refine(&theme_overrides.status_colors_refinement());
             base_theme.styles.player.merge(&theme_overrides.players);
-            base_theme.styles.syntax = Arc::new(SyntaxTheme {
-                highlights: {
-                    let mut highlights = base_theme.styles.syntax.highlights.clone();
-                    // Overrides come second in the highlight list so that they take precedence
-                    // over the ones in the base theme.
-                    highlights.extend(theme_overrides.syntax_overrides());
-                    highlights
-                },
-            });
+            base_theme.styles.accents.merge(&theme_overrides.accents);
+            base_theme.styles.syntax =
+                SyntaxTheme::merge(base_theme.styles.syntax, theme_overrides.syntax_overrides());
 
             self.active_theme = Arc::new(base_theme);
         }
@@ -292,7 +363,13 @@ pub fn adjusted_font_size(size: Pixels, cx: &mut AppContext) -> Pixels {
     .max(MIN_FONT_SIZE)
 }
 
-pub fn adjust_font_size(cx: &mut AppContext, f: fn(&mut Pixels)) {
+pub fn get_buffer_font_size(cx: &AppContext) -> Pixels {
+    let buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size;
+    cx.try_global::<AdjustedBufferFontSize>()
+        .map_or(buffer_font_size, |adjusted_size| adjusted_size.0)
+}
+
+pub fn adjust_buffer_font_size(cx: &mut AppContext, f: fn(&mut Pixels)) {
     let buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size;
     let mut adjusted_size = cx
         .try_global::<AdjustedBufferFontSize>()
@@ -304,9 +381,45 @@ pub fn adjust_font_size(cx: &mut AppContext, f: fn(&mut Pixels)) {
     cx.refresh();
 }
 
-pub fn reset_font_size(cx: &mut AppContext) {
+pub fn reset_buffer_font_size(cx: &mut AppContext) {
     if cx.has_global::<AdjustedBufferFontSize>() {
         cx.remove_global::<AdjustedBufferFontSize>();
+        cx.refresh();
+    }
+}
+
+pub fn setup_ui_font(cx: &mut WindowContext) -> gpui::Font {
+    let (ui_font, ui_font_size) = {
+        let theme_settings = ThemeSettings::get_global(cx);
+        let font = theme_settings.ui_font.clone();
+        (font, get_ui_font_size(cx))
+    };
+
+    cx.set_rem_size(ui_font_size);
+    ui_font
+}
+
+pub fn get_ui_font_size(cx: &WindowContext) -> Pixels {
+    let ui_font_size = ThemeSettings::get_global(cx).ui_font_size;
+    cx.try_global::<AdjustedUiFontSize>()
+        .map_or(ui_font_size, |adjusted_size| adjusted_size.0)
+}
+
+pub fn adjust_ui_font_size(cx: &mut WindowContext, f: fn(&mut Pixels)) {
+    let ui_font_size = ThemeSettings::get_global(cx).ui_font_size;
+    let mut adjusted_size = cx
+        .try_global::<AdjustedUiFontSize>()
+        .map_or(ui_font_size, |adjusted_size| adjusted_size.0);
+
+    f(&mut adjusted_size);
+    adjusted_size = adjusted_size.max(MIN_FONT_SIZE);
+    cx.set_global(AdjustedUiFontSize(adjusted_size));
+    cx.refresh();
+}
+
+pub fn reset_ui_font_size(cx: &mut WindowContext) {
+    if cx.has_global::<AdjustedUiFontSize>() {
+        cx.remove_global::<AdjustedUiFontSize>();
         cx.refresh();
     }
 }
@@ -316,26 +429,23 @@ impl settings::Settings for ThemeSettings {
 
     type FileContent = ThemeSettingsContent;
 
-    fn load(
-        defaults: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        cx: &mut AppContext,
-    ) -> Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, cx: &mut AppContext) -> Result<Self> {
         let themes = ThemeRegistry::default_global(cx);
         let system_appearance = SystemAppearance::default_global(cx);
 
+        let defaults = sources.default;
         let mut this = Self {
             ui_font_size: defaults.ui_font_size.unwrap().into(),
             ui_font: Font {
                 family: defaults.ui_font_family.clone().unwrap().into(),
-                features: defaults.ui_font_features.unwrap(),
-                weight: Default::default(),
+                features: defaults.ui_font_features.clone().unwrap(),
+                weight: defaults.ui_font_weight.map(FontWeight).unwrap(),
                 style: Default::default(),
             },
             buffer_font: Font {
                 family: defaults.buffer_font_family.clone().unwrap().into(),
-                features: defaults.buffer_font_features.unwrap(),
-                weight: FontWeight::default(),
+                features: defaults.buffer_font_features.clone().unwrap(),
+                weight: defaults.buffer_font_weight.map(FontWeight).unwrap(),
                 style: FontStyle::default(),
             },
             buffer_font_size: defaults.buffer_font_size.unwrap().into(),
@@ -346,21 +456,33 @@ impl settings::Settings for ThemeSettings {
                 .or(themes.get(&one_dark().name))
                 .unwrap(),
             theme_overrides: None,
+            ui_density: defaults.ui_density.unwrap_or(UiDensity::Default),
         };
 
-        for value in user_values.iter().copied().cloned() {
-            if let Some(value) = value.buffer_font_family {
+        for value in sources.user.into_iter().chain(sources.release_channel) {
+            if let Some(value) = value.ui_density {
+                this.ui_density = value;
+            }
+
+            if let Some(value) = value.buffer_font_family.clone() {
                 this.buffer_font.family = value.into();
             }
-            if let Some(value) = value.buffer_font_features {
+            if let Some(value) = value.buffer_font_features.clone() {
                 this.buffer_font.features = value;
             }
 
-            if let Some(value) = value.ui_font_family {
+            if let Some(value) = value.buffer_font_weight {
+                this.buffer_font.weight = FontWeight(value);
+            }
+
+            if let Some(value) = value.ui_font_family.clone() {
                 this.ui_font.family = value.into();
             }
-            if let Some(value) = value.ui_font_features {
+            if let Some(value) = value.ui_font_features.clone() {
                 this.ui_font.features = value;
+            }
+            if let Some(value) = value.ui_font_weight {
+                this.ui_font.weight = FontWeight(value);
             }
 
             if let Some(value) = &value.theme {
@@ -373,7 +495,7 @@ impl settings::Settings for ThemeSettings {
                 }
             }
 
-            this.theme_overrides = value.theme_overrides;
+            this.theme_overrides.clone_from(&value.theme_overrides);
             this.apply_theme_overrides();
 
             merge(&mut this.ui_font_size, value.ui_font_size.map(Into::into));

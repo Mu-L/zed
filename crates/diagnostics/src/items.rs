@@ -1,13 +1,9 @@
-use std::time::Duration;
-
-use collections::HashSet;
 use editor::Editor;
 use gpui::{
-    percentage, rems, Animation, AnimationExt, EventEmitter, IntoElement, ParentElement, Render,
-    Styled, Subscription, Transformation, View, ViewContext, WeakView,
+    rems, EventEmitter, IntoElement, ParentElement, Render, Styled, Subscription, View,
+    ViewContext, WeakView,
 };
 use language::Diagnostic;
-use lsp::LanguageServerId;
 use ui::{h_flex, prelude::*, Button, ButtonLike, Color, Icon, IconName, Label, Tooltip};
 use workspace::{item::ItemHandle, StatusItemView, ToolbarItemEvent, Workspace};
 
@@ -18,7 +14,6 @@ pub struct DiagnosticIndicator {
     active_editor: Option<WeakView<Editor>>,
     workspace: WeakView<Workspace>,
     current_diagnostic: Option<Diagnostic>,
-    in_progress_checks: HashSet<LanguageServerId>,
     _observe_active_editor: Option<Subscription>,
 }
 
@@ -64,29 +59,7 @@ impl Render for DiagnosticIndicator {
                 .child(Label::new(warning_count.to_string()).size(LabelSize::Small)),
         };
 
-        let status = if !self.in_progress_checks.is_empty() {
-            Some(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::ArrowCircle)
-                            .size(IconSize::Small)
-                            .with_animation(
-                                "arrow-circle",
-                                Animation::new(Duration::from_secs(2)).repeat(),
-                                |icon, delta| {
-                                    icon.transform(Transformation::rotate(percentage(delta)))
-                                },
-                            ),
-                    )
-                    .child(
-                        Label::new("Checking…")
-                            .size(LabelSize::Small)
-                            .into_any_element(),
-                    )
-                    .into_any_element(),
-            )
-        } else if let Some(diagnostic) = &self.current_diagnostic {
+        let status = if let Some(diagnostic) = &self.current_diagnostic {
             let message = diagnostic.message.split('\n').next().unwrap().to_string();
             Some(
                 Button::new("diagnostic_message", message)
@@ -126,15 +99,13 @@ impl DiagnosticIndicator {
     pub fn new(workspace: &Workspace, cx: &mut ViewContext<Self>) -> Self {
         let project = workspace.project();
         cx.subscribe(project, |this, project, event, cx| match event {
-            project::Event::DiskBasedDiagnosticsStarted { language_server_id } => {
-                this.in_progress_checks.insert(*language_server_id);
+            project::Event::DiskBasedDiagnosticsStarted { .. } => {
                 cx.notify();
             }
 
-            project::Event::DiskBasedDiagnosticsFinished { language_server_id }
-            | project::Event::LanguageServerRemoved(language_server_id) => {
+            project::Event::DiskBasedDiagnosticsFinished { .. }
+            | project::Event::LanguageServerRemoved(_) => {
                 this.summary = project.read(cx).diagnostic_summary(false, cx);
-                this.in_progress_checks.remove(language_server_id);
                 cx.notify();
             }
 
@@ -149,10 +120,6 @@ impl DiagnosticIndicator {
 
         Self {
             summary: project.read(cx).diagnostic_summary(false, cx),
-            in_progress_checks: project
-                .read(cx)
-                .language_servers_running_disk_based_diagnostics()
-                .collect(),
             active_editor: None,
             workspace: workspace.weak_handle(),
             current_diagnostic: None,

@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use ::util::ResultExt;
-use windows::Win32::{Foundation::*, System::Threading::*, UI::WindowsAndMessaging::*};
+use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
 
 use crate::*;
 
@@ -74,33 +74,6 @@ pub(crate) unsafe fn set_window_long(
     }
 }
 
-pub(crate) struct OwnedHandle(HANDLE);
-
-impl OwnedHandle {
-    pub(crate) fn new(handle: HANDLE) -> Self {
-        Self(handle)
-    }
-
-    #[inline(always)]
-    pub(crate) fn to_raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe { CloseHandle(self.0) }.log_err();
-        }
-    }
-}
-
-pub(crate) fn create_event() -> windows::core::Result<OwnedHandle> {
-    Ok(OwnedHandle::new(unsafe {
-        CreateEventW(None, false, false, None)?
-    }))
-}
-
 pub(crate) fn windows_credentials_target_name(url: &str) -> String {
     format!("zed:url={}", url)
 }
@@ -117,12 +90,14 @@ pub(crate) fn load_cursor(style: CursorStyle) -> HCURSOR {
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
         CursorStyle::Crosshair => (&CROSS, IDC_CROSS),
         CursorStyle::PointingHand | CursorStyle::DragLink => (&HAND, IDC_HAND),
-        CursorStyle::ResizeLeft | CursorStyle::ResizeRight | CursorStyle::ResizeLeftRight => {
-            (&SIZEWE, IDC_SIZEWE)
-        }
-        CursorStyle::ResizeUp | CursorStyle::ResizeDown | CursorStyle::ResizeUpDown => {
-            (&SIZENS, IDC_SIZENS)
-        }
+        CursorStyle::ResizeLeft
+        | CursorStyle::ResizeRight
+        | CursorStyle::ResizeLeftRight
+        | CursorStyle::ResizeColumn => (&SIZEWE, IDC_SIZEWE),
+        CursorStyle::ResizeUp
+        | CursorStyle::ResizeDown
+        | CursorStyle::ResizeUpDown
+        | CursorStyle::ResizeRow => (&SIZENS, IDC_SIZENS),
         CursorStyle::OperationNotAllowed => (&NO, IDC_NO),
         _ => (&ARROW, IDC_ARROW),
     };
@@ -134,4 +109,12 @@ pub(crate) fn load_cursor(style: CursorStyle) -> HCURSOR {
                 .0,
         )
     })
+}
+
+#[inline]
+pub(crate) fn logical_point(x: f32, y: f32, scale_factor: f32) -> Point<Pixels> {
+    Point {
+        x: px(x / scale_factor),
+        y: px(y / scale_factor),
+    }
 }

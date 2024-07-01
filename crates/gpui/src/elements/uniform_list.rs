@@ -5,9 +5,10 @@
 //! elements with uniform height.
 
 use crate::{
-    point, px, size, AnyElement, AvailableSpace, Bounds, ContentMask, Element, ElementContext,
-    ElementId, Hitbox, InteractiveElement, Interactivity, IntoElement, LayoutId, Pixels, Render,
-    ScrollHandle, Size, StyleRefinement, Styled, View, ViewContext, WindowContext,
+    point, px, size, AnyElement, AvailableSpace, Bounds, ContentMask, Element, ElementId,
+    GlobalElementId, Hitbox, InteractiveElement, Interactivity, IntoElement, LayoutId,
+    ListSizingBehavior, Pixels, Render, ScrollHandle, Size, StyleRefinement, Styled, View,
+    ViewContext, WindowContext,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc};
@@ -55,6 +56,7 @@ where
             ..Default::default()
         },
         scroll_handle: None,
+        sizing_behavior: ListSizingBehavior::default(),
     }
 }
 
@@ -66,6 +68,7 @@ pub struct UniformList {
         Box<dyn for<'a> Fn(Range<usize>, &'a mut WindowContext) -> SmallVec<[AnyElement; 64]>>,
     interactivity: Interactivity,
     scroll_handle: Option<UniformListScrollHandle>,
+    sizing_behavior: ListSizingBehavior,
 }
 
 /// Frame state used by the [UniformList].
@@ -76,24 +79,37 @@ pub struct UniformListFrameState {
 
 /// A handle for controlling the scroll position of a uniform list.
 /// This should be stored in your view and passed to the uniform_list on each frame.
-#[derive(Clone, Default)]
-pub struct UniformListScrollHandle {
-    base_handle: ScrollHandle,
-    deferred_scroll_to_item: Rc<RefCell<Option<usize>>>,
+#[derive(Clone, Debug, Default)]
+pub struct UniformListScrollHandle(pub Rc<RefCell<UniformListScrollState>>);
+
+#[derive(Clone, Debug, Default)]
+#[allow(missing_docs)]
+pub struct UniformListScrollState {
+    pub base_handle: ScrollHandle,
+    pub deferred_scroll_to_item: Option<usize>,
+    pub last_item_height: Option<Pixels>,
 }
 
 impl UniformListScrollHandle {
     /// Create a new scroll handle to bind to a uniform list.
     pub fn new() -> Self {
-        Self {
+        Self(Rc::new(RefCell::new(UniformListScrollState {
             base_handle: ScrollHandle::new(),
-            deferred_scroll_to_item: Rc::new(RefCell::new(None)),
-        }
+            deferred_scroll_to_item: None,
+            last_item_height: None,
+        })))
     }
 
     /// Scroll the list to the given item index.
     pub fn scroll_to_item(&mut self, ix: usize) {
-        self.deferred_scroll_to_item.replace(Some(ix));
+        self.0.borrow_mut().deferred_scroll_to_item = Some(ix);
+    }
+
+    /// Get the index of the topmost visible child.
+    pub fn logical_scroll_top_index(&self) -> usize {
+        let this = self.0.borrow();
+        this.deferred_scroll_to_item
+            .unwrap_or_else(|| this.base_handle.logical_scroll_top().0)
     }
 }
 
@@ -104,29 +120,52 @@ impl Styled for UniformList {
 }
 
 impl Element for UniformList {
-    type BeforeLayout = UniformListFrameState;
-    type AfterLayout = Option<Hitbox>;
+    type RequestLayoutState = UniformListFrameState;
+    type PrepaintState = Option<Hitbox>;
 
-    fn before_layout(&mut self, cx: &mut ElementContext) -> (LayoutId, Self::BeforeLayout) {
+    fn id(&self) -> Option<ElementId> {
+        self.interactivity.element_id.clone()
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        cx: &mut WindowContext,
+    ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
         let item_size = self.measure_item(None, cx);
-        let layout_id = self.interactivity.before_layout(cx, |style, cx| {
-            cx.request_measured_layout(style, move |known_dimensions, available_space, _cx| {
-                let desired_height = item_size.height * max_items;
-                let width = known_dimensions
-                    .width
-                    .unwrap_or(match available_space.width {
-                        AvailableSpace::Definite(x) => x,
-                        AvailableSpace::MinContent | AvailableSpace::MaxContent => item_size.width,
-                    });
-
-                let height = match available_space.height {
-                    AvailableSpace::Definite(height) => desired_height.min(height),
-                    AvailableSpace::MinContent | AvailableSpace::MaxContent => desired_height,
-                };
-                size(width, height)
-            })
-        });
+        let layout_id = self
+            .interactivity
+            .request_layout(global_id, cx, |style, cx| match self.sizing_behavior {
+                ListSizingBehavior::Infer => {
+                    cx.with_text_style(style.text_style().cloned(), |cx| {
+                        cx.request_measured_layout(
+                            style,
+                            move |known_dimensions, available_space, _cx| {
+                                let desired_height = item_size.height * max_items;
+                                let width = known_dimensions.width.unwrap_or(match available_space
+                                    .width
+                                {
+                                    AvailableSpace::Definite(x) => x,
+                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                                        item_size.width
+                                    }
+                                });
+                                let height = match available_space.height {
+                                    AvailableSpace::Definite(height) => desired_height.min(height),
+                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                                        desired_height
+                                    }
+                                };
+                                size(width, height)
+                            },
+                        )
+                    })
+                }
+                ListSizingBehavior::Auto => cx.with_text_style(style.text_style().cloned(), |cx| {
+                    cx.request_layout(style, None)
+                }),
+            });
 
         (
             layout_id,
@@ -137,13 +176,14 @@ impl Element for UniformList {
         )
     }
 
-    fn after_layout(
+    fn prepaint(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         bounds: Bounds<Pixels>,
-        before_layout: &mut Self::BeforeLayout,
-        cx: &mut ElementContext,
+        frame_state: &mut Self::RequestLayoutState,
+        cx: &mut WindowContext,
     ) -> Option<Hitbox> {
-        let style = self.interactivity.compute_style(None, cx);
+        let style = self.interactivity.compute_style(global_id, None, cx);
         let border = style.border_widths.to_pixels(cx.rem_size());
         let padding = style.padding.to_pixels(bounds.size.into(), cx.rem_size());
 
@@ -155,18 +195,20 @@ impl Element for UniformList {
 
         let content_size = Size {
             width: padded_bounds.size.width,
-            height: before_layout.item_size.height * self.item_count + padding.top + padding.bottom,
+            height: frame_state.item_size.height * self.item_count + padding.top + padding.bottom,
         };
 
         let shared_scroll_offset = self.interactivity.scroll_offset.clone().unwrap();
 
         let item_height = self.measure_item(Some(padded_bounds.size.width), cx).height;
-        let shared_scroll_to_item = self
-            .scroll_handle
-            .as_mut()
-            .and_then(|handle| handle.deferred_scroll_to_item.take());
+        let shared_scroll_to_item = self.scroll_handle.as_mut().and_then(|handle| {
+            let mut handle = handle.0.borrow_mut();
+            handle.last_item_height = Some(item_height);
+            handle.deferred_scroll_to_item.take()
+        });
 
-        self.interactivity.after_layout(
+        self.interactivity.prepaint(
+            global_id,
             bounds,
             content_size,
             cx,
@@ -178,6 +220,10 @@ impl Element for UniformList {
                     bounds.origin + point(border.left + padding.left, border.top),
                     bounds.lower_right() - point(border.right + padding.right, border.bottom),
                 );
+
+                if let Some(handle) = self.scroll_handle.as_mut() {
+                    handle.0.borrow_mut().base_handle.set_bounds(bounds);
+                }
 
                 if self.item_count > 0 {
                     let content_height =
@@ -222,8 +268,9 @@ impl Element for UniformList {
                                 AvailableSpace::Definite(padded_bounds.size.width),
                                 AvailableSpace::Definite(item_height),
                             );
-                            item.layout(item_origin, available_space, cx);
-                            before_layout.items.push(item);
+                            item.layout_as_root(available_space, cx);
+                            item.prepaint_at(item_origin, cx);
+                            frame_state.items.push(item);
                         }
                     });
                 }
@@ -235,14 +282,15 @@ impl Element for UniformList {
 
     fn paint(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         bounds: Bounds<crate::Pixels>,
-        before_layout: &mut Self::BeforeLayout,
+        request_layout: &mut Self::RequestLayoutState,
         hitbox: &mut Option<Hitbox>,
-        cx: &mut ElementContext,
+        cx: &mut WindowContext,
     ) {
         self.interactivity
-            .paint(bounds, hitbox.as_ref(), cx, |_, cx| {
-                for item in &mut before_layout.items {
+            .paint(global_id, bounds, hitbox.as_ref(), cx, |_, cx| {
+                for item in &mut request_layout.items {
                     item.paint(cx);
                 }
             })
@@ -264,7 +312,13 @@ impl UniformList {
         self
     }
 
-    fn measure_item(&self, list_width: Option<Pixels>, cx: &mut ElementContext) -> Size<Pixels> {
+    /// Sets the sizing behavior, similar to the `List` element.
+    pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
+        self.sizing_behavior = behavior;
+        self
+    }
+
+    fn measure_item(&self, list_width: Option<Pixels>, cx: &mut WindowContext) -> Size<Pixels> {
         if self.item_count == 0 {
             return Size::default();
         }
@@ -278,12 +332,12 @@ impl UniformList {
             }),
             AvailableSpace::MinContent,
         );
-        item_to_measure.measure(available_space, cx)
+        item_to_measure.layout_as_root(available_space, cx)
     }
 
     /// Track and render scroll state of this list with reference to the given scroll handle.
     pub fn track_scroll(mut self, handle: UniformListScrollHandle) -> Self {
-        self.interactivity.tracked_scroll_handle = Some(handle.base_handle.clone());
+        self.interactivity.tracked_scroll_handle = Some(handle.0.borrow().base_handle.clone());
         self.scroll_handle = Some(handle);
         self
     }

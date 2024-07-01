@@ -17,9 +17,9 @@ use futures::{
     TryFutureExt as _, TryStreamExt,
 };
 use gpui::{
-    actions, AnyModel, AnyWeakModel, AppContext, AsyncAppContext, BorrowAppContext, Global, Model,
-    Task, WeakModel,
+    actions, AnyModel, AnyWeakModel, AppContext, AsyncAppContext, Global, Model, Task, WeakModel,
 };
+use http::{HttpClient, HttpClientWithUrl};
 use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use postage::watch;
@@ -28,8 +28,9 @@ use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::{AnyTypedEnvelope, EntityMessage, EnvelopedMessage, PeerId, RequestMessage};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsStore};
+use settings::{Settings, SettingsSources};
 use std::fmt;
+use std::pin::Pin;
 use std::{
     any::TypeId,
     convert::TryFrom,
@@ -46,7 +47,6 @@ use std::{
 use telemetry::Telemetry;
 use thiserror::Error;
 use url::Url;
-use util::http::{HttpClient, HttpClientWithUrl};
 use util::{ResultExt, TryFutureExt};
 
 pub use rpc::*;
@@ -65,6 +65,13 @@ impl fmt::Display for DevServerToken {
 lazy_static! {
     static ref ZED_SERVER_URL: Option<String> = std::env::var("ZED_SERVER_URL").ok();
     static ref ZED_RPC_URL: Option<String> = std::env::var("ZED_RPC_URL").ok();
+    /// An environment variable whose presence indicates that the development auth
+    /// provider should be used.
+    ///
+    /// Only works in development. Setting this environment variable in other release
+    /// channels is a no-op.
+    pub static ref ZED_DEVELOPMENT_AUTH: bool =
+        std::env::var("ZED_DEVELOPMENT_AUTH").map_or(false, |value| !value.is_empty());
     pub static ref IMPERSONATE_LOGIN: Option<String> = std::env::var("ZED_IMPERSONATE")
         .ok()
         .and_then(|s| if s.is_empty() { None } else { Some(s) });
@@ -77,8 +84,9 @@ lazy_static! {
         std::env::var("ZED_ALWAYS_ACTIVE").map_or(false, |e| !e.is_empty());
 }
 
-pub const INITIAL_RECONNECTION_DELAY: Duration = Duration::from_millis(100);
-pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+pub const INITIAL_RECONNECTION_DELAY: Duration = Duration::from_millis(500);
+pub const MAX_RECONNECTION_DELAY: Duration = Duration::from_secs(10);
+pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 
 actions!(client, [SignIn, SignOut, Reconnect]);
 
@@ -97,27 +105,44 @@ impl Settings for ClientSettings {
 
     type FileContent = ClientSettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let mut result = Self::load_via_json_merge(default_value, user_values)?;
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        let mut result = sources.json_merge::<Self>()?;
         if let Some(server_url) = &*ZED_SERVER_URL {
-            result.server_url = server_url.clone()
+            result.server_url.clone_from(&server_url)
         }
         Ok(result)
     }
 }
 
+#[derive(Default, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProxySettingsContent {
+    proxy: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ProxySettings {
+    pub proxy: Option<String>,
+}
+
+impl Settings for ProxySettings {
+    const KEY: Option<&'static str> = None;
+
+    type FileContent = ProxySettingsContent;
+
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        Ok(Self {
+            proxy: sources
+                .user
+                .and_then(|value| value.proxy.clone())
+                .or(sources.default.proxy.clone()),
+        })
+    }
+}
+
 pub fn init_settings(cx: &mut AppContext) {
     TelemetrySettings::register(cx);
-    cx.update_global(|store: &mut SettingsStore, cx| {
-        store.register_setting::<ClientSettings>(cx);
-    });
+    ClientSettings::register(cx);
+    ProxySettings::register(cx);
 }
 
 pub fn init(client: &Arc<Client>, cx: &mut AppContext) {
@@ -139,7 +164,7 @@ pub fn init(client: &Arc<Client>, cx: &mut AppContext) {
         move |_: &SignOut, cx| {
             if let Some(client) = client.upgrade() {
                 cx.spawn(|cx| async move {
-                    client.disconnect(&cx);
+                    client.sign_out(&cx).await;
                 })
                 .detach();
             }
@@ -168,6 +193,7 @@ pub struct Client {
     peer: Arc<Peer>,
     http: Arc<HttpClientWithUrl>,
     telemetry: Arc<Telemetry>,
+    credentials_provider: Arc<dyn CredentialsProvider + Send + Sync + 'static>,
     state: RwLock<ClientState>,
 
     #[allow(clippy::type_complexity)]
@@ -202,7 +228,7 @@ pub enum EstablishConnectionError {
     #[error("{0}")]
     Other(#[from] anyhow::Error),
     #[error("{0}")]
-    Http(#[from] util::http::Error),
+    Http(#[from] http::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -262,7 +288,6 @@ struct ClientState {
     status: (watch::Sender<Status>, watch::Receiver<Status>),
     entity_id_extractors: HashMap<TypeId, fn(&dyn AnyTypedEnvelope) -> u64>,
     _reconnect_task: Option<Task<()>>,
-    reconnect_interval: Duration,
     entities_by_type_and_remote_id: HashMap<(TypeId, u64), WeakSubscriber>,
     models_by_message_type: HashMap<TypeId, AnyWeakModel>,
     entity_types_by_message_type: HashMap<TypeId, TypeId>,
@@ -305,6 +330,32 @@ impl Credentials {
     }
 }
 
+/// A provider for [`Credentials`].
+///
+/// Used to abstract over reading and writing credentials to some form of
+/// persistence (like the system keychain).
+trait CredentialsProvider {
+    /// Reads the credentials from the provider.
+    fn read_credentials<'a>(
+        &'a self,
+        cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Option<Credentials>> + 'a>>;
+
+    /// Writes the credentials to the provider.
+    fn write_credentials<'a>(
+        &'a self,
+        user_id: u64,
+        access_token: String,
+        cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+    /// Deletes the credentials from the provider.
+    fn delete_credentials<'a>(
+        &'a self,
+        cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+}
+
 impl Default for ClientState {
     fn default() -> Self {
         Self {
@@ -312,7 +363,6 @@ impl Default for ClientState {
             status: watch::channel_with(Status::SignedOut),
             entity_id_extractors: Default::default(),
             _reconnect_task: None,
-            reconnect_interval: Duration::from_secs(5),
             models_by_message_type: Default::default(),
             entities_by_type_and_remote_id: Default::default(),
             entity_types_by_message_type: Default::default(),
@@ -427,21 +477,19 @@ impl settings::Settings for TelemetrySettings {
 
     type FileContent = TelemetrySettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
         Ok(Self {
-            diagnostics: user_values.first().and_then(|v| v.diagnostics).unwrap_or(
-                default_value
+            diagnostics: sources.user.as_ref().and_then(|v| v.diagnostics).unwrap_or(
+                sources
+                    .default
                     .diagnostics
                     .ok_or_else(Self::missing_default)?,
             ),
-            metrics: user_values
-                .first()
+            metrics: sources
+                .user
+                .as_ref()
                 .and_then(|v| v.metrics)
-                .unwrap_or(default_value.metrics.ok_or_else(Self::missing_default)?),
+                .unwrap_or(sources.default.metrics.ok_or_else(Self::missing_default)?),
         })
     }
 }
@@ -452,11 +500,27 @@ impl Client {
         http: Arc<HttpClientWithUrl>,
         cx: &mut AppContext,
     ) -> Arc<Self> {
+        let use_zed_development_auth = match ReleaseChannel::try_global(cx) {
+            Some(ReleaseChannel::Dev) => *ZED_DEVELOPMENT_AUTH,
+            Some(ReleaseChannel::Nightly | ReleaseChannel::Preview | ReleaseChannel::Stable)
+            | None => false,
+        };
+
+        let credentials_provider: Arc<dyn CredentialsProvider + Send + Sync + 'static> =
+            if use_zed_development_auth {
+                Arc::new(DevelopmentCredentialsProvider {
+                    path: paths::config_dir().join("development_auth"),
+                })
+            } else {
+                Arc::new(KeychainCredentialsProvider)
+            };
+
         Arc::new(Self {
             id: AtomicU64::new(0),
             peer: Peer::new(0),
             telemetry: Telemetry::new(clock, http.clone(), cx),
             http,
+            credentials_provider,
             state: Default::default(),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -464,6 +528,15 @@ impl Client {
             #[cfg(any(test, feature = "test-support"))]
             establish_connection: Default::default(),
         })
+    }
+
+    pub fn production(cx: &mut AppContext) -> Arc<Self> {
+        let clock = Arc::new(clock::RealSystemClock);
+        let http = Arc::new(HttpClientWithUrl::new(
+            &ClientSettings::get_global(cx).server_url,
+            ProxySettings::get_global(cx).proxy.clone(),
+        ));
+        Self::new(clock, http.clone(), cx)
     }
 
     pub fn id(&self) -> u64 {
@@ -549,7 +622,6 @@ impl Client {
             }
             Status::ConnectionLost => {
                 let this = self.clone();
-                let reconnect_interval = state.reconnect_interval;
                 state._reconnect_task = Some(cx.spawn(move |cx| async move {
                     #[cfg(any(test, feature = "test-support"))]
                     let mut rng = StdRng::seed_from_u64(0);
@@ -568,8 +640,9 @@ impl Client {
                             );
                             cx.background_executor().timer(delay).await;
                             delay = delay
-                                .mul_f32(rng.gen_range(1.0..=2.0))
-                                .min(reconnect_interval);
+                                .mul_f32(rng.gen_range(0.5..=2.5))
+                                .max(INITIAL_RECONNECTION_DELAY)
+                                .min(MAX_RECONNECTION_DELAY);
                         } else {
                             break;
                         }
@@ -612,6 +685,22 @@ impl Client {
 
     #[track_caller]
     pub fn add_message_handler<M, E, H, F>(
+        self: &Arc<Self>,
+        entity: WeakModel<E>,
+        handler: H,
+    ) -> Subscription
+    where
+        M: EnvelopedMessage,
+        E: 'static,
+        H: 'static + Sync + Fn(Model<E>, TypedEnvelope<M>, AsyncAppContext) -> F + Send + Sync,
+        F: 'static + Future<Output = Result<()>>,
+    {
+        self.add_message_handler_impl(entity, move |model, message, _, cx| {
+            handler(model, message, cx)
+        })
+    }
+
+    fn add_message_handler_impl<M, E, H, F>(
         self: &Arc<Self>,
         entity: WeakModel<E>,
         handler: H,
@@ -664,19 +753,11 @@ impl Client {
     where
         M: RequestMessage,
         E: 'static,
-        H: 'static
-            + Sync
-            + Fn(Model<E>, TypedEnvelope<M>, Arc<Self>, AsyncAppContext) -> F
-            + Send
-            + Sync,
+        H: 'static + Sync + Fn(Model<E>, TypedEnvelope<M>, AsyncAppContext) -> F + Send + Sync,
         F: 'static + Future<Output = Result<M::Response>>,
     {
-        self.add_message_handler(model, move |handle, envelope, this, cx| {
-            Self::respond_to_request(
-                envelope.receipt(),
-                handler(handle, envelope, this.clone(), cx),
-                this,
-            )
+        self.add_message_handler_impl(model, move |handle, envelope, this, cx| {
+            Self::respond_to_request(envelope.receipt(), handler(handle, envelope, cx), this)
         })
     }
 
@@ -684,11 +765,11 @@ impl Client {
     where
         M: EntityMessage,
         E: 'static,
-        H: 'static + Fn(Model<E>, TypedEnvelope<M>, Arc<Self>, AsyncAppContext) -> F + Send + Sync,
+        H: 'static + Fn(Model<E>, TypedEnvelope<M>, AsyncAppContext) -> F + Send + Sync,
         F: 'static + Future<Output = Result<()>>,
     {
-        self.add_entity_message_handler::<M, E, _, _>(move |subscriber, message, client, cx| {
-            handler(subscriber.downcast::<E>().unwrap(), message, client, cx)
+        self.add_entity_message_handler::<M, E, _, _>(move |subscriber, message, _, cx| {
+            handler(subscriber.downcast::<E>().unwrap(), message, cx)
         })
     }
 
@@ -735,13 +816,13 @@ impl Client {
     where
         M: EntityMessage + RequestMessage,
         E: 'static,
-        H: 'static + Fn(Model<E>, TypedEnvelope<M>, Arc<Self>, AsyncAppContext) -> F + Send + Sync,
+        H: 'static + Fn(Model<E>, TypedEnvelope<M>, AsyncAppContext) -> F + Send + Sync,
         F: 'static + Future<Output = Result<M::Response>>,
     {
-        self.add_model_message_handler(move |entity, envelope, client, cx| {
+        self.add_entity_message_handler::<M, E, _, _>(move |entity, envelope, client, cx| {
             Self::respond_to_request::<M, _>(
                 envelope.receipt(),
-                handler(entity, envelope, client.clone(), cx),
+                handler(entity.downcast::<E>().unwrap(), envelope, cx),
                 client,
             )
         })
@@ -764,18 +845,22 @@ impl Client {
         }
     }
 
-    pub async fn has_keychain_credentials(&self, cx: &AsyncAppContext) -> bool {
-        read_credentials_from_keychain(cx).await.is_some()
+    pub async fn has_credentials(&self, cx: &AsyncAppContext) -> bool {
+        self.credentials_provider
+            .read_credentials(cx)
+            .await
+            .is_some()
     }
 
-    pub fn set_dev_server_token(&self, token: DevServerToken) {
+    pub fn set_dev_server_token(&self, token: DevServerToken) -> &Self {
         self.state.write().credentials = Some(Credentials::DevServer { token });
+        self
     }
 
     #[async_recursion(?Send)]
     pub async fn authenticate_and_connect(
         self: &Arc<Self>,
-        try_keychain: bool,
+        try_provider: bool,
         cx: &AsyncAppContext,
     ) -> anyhow::Result<()> {
         let was_disconnected = match *self.status().borrow() {
@@ -790,19 +875,19 @@ impl Client {
             }
             Status::UpgradeRequired => return Err(EstablishConnectionError::UpgradeRequired)?,
         };
-
         if was_disconnected {
             self.set_status(Status::Authenticating, cx);
         } else {
             self.set_status(Status::Reauthenticating, cx)
         }
 
-        let mut read_from_keychain = false;
+        let mut read_from_provider = false;
         let mut credentials = self.state.read().credentials.clone();
-        if credentials.is_none() && try_keychain {
-            credentials = read_credentials_from_keychain(cx).await;
-            read_from_keychain = credentials.is_some();
+        if credentials.is_none() && try_provider {
+            credentials = self.credentials_provider.read_credentials(cx).await;
+            read_from_provider = credentials.is_some();
         }
+
         if credentials.is_none() {
             let mut status_rx = self.status();
             let _ = status_rx.next().await;
@@ -839,9 +924,9 @@ impl Client {
                 match connection {
                     Ok(conn) => {
                         self.state.write().credentials = Some(credentials.clone());
-                        if !read_from_keychain && IMPERSONATE_LOGIN.is_none() {
+                        if !read_from_provider && IMPERSONATE_LOGIN.is_none() {
                             if let Credentials::User{user_id, access_token} = credentials {
-                                write_credentials_to_keychain(user_id, access_token, cx).await.log_err();
+                                self.credentials_provider.write_credentials(user_id, access_token, cx).await.log_err();
                             }
                         }
 
@@ -855,8 +940,8 @@ impl Client {
                     }
                     Err(EstablishConnectionError::Unauthorized) => {
                         self.state.write().credentials.take();
-                        if read_from_keychain {
-                            delete_credentials_from_keychain(cx).await.log_err();
+                        if read_from_provider {
+                            self.credentials_provider.delete_credentials(cx).await.log_err();
                             self.set_status(Status::SignedOut, cx);
                             self.authenticate_and_connect(false, cx).await
                         } else {
@@ -1128,6 +1213,8 @@ impl Client {
                     if let Some((login, token)) =
                         IMPERSONATE_LOGIN.as_ref().zip(ADMIN_API_TOKEN.as_ref())
                     {
+                        eprintln!("authenticate as admin {login}, {token}");
+
                         return Self::authenticate_as_admin(http, login.clone(), token.clone())
                             .await;
                     }
@@ -1259,6 +1346,18 @@ impl Client {
         })
     }
 
+    pub async fn sign_out(self: &Arc<Self>, cx: &AsyncAppContext) {
+        self.state.write().credentials = None;
+        self.disconnect(&cx);
+
+        if self.has_credentials(cx).await {
+            self.credentials_provider
+                .delete_credentials(cx)
+                .await
+                .log_err();
+        }
+    }
+
     pub fn disconnect(self: &Arc<Self>, cx: &AsyncAppContext) {
         self.peer.teardown();
         self.set_status(Status::SignedOut, cx);
@@ -1335,6 +1434,31 @@ impl Client {
                 T::NAME
             );
             response
+        }
+    }
+
+    pub fn request_dynamic(
+        &self,
+        envelope: proto::Envelope,
+        request_type: &'static str,
+    ) -> impl Future<Output = Result<proto::Envelope>> {
+        let client_id = self.id();
+        log::debug!(
+            "rpc request start. client_id:{}. name:{}",
+            client_id,
+            request_type
+        );
+        let response = self
+            .connection_id()
+            .map(|conn_id| self.peer.request_dynamic(conn_id, envelope, request_type));
+        async move {
+            let response = response?.await;
+            log::debug!(
+                "rpc request finish. client_id:{}. name:{}",
+                client_id,
+                request_type
+            );
+            Ok(response?.0)
         }
     }
 
@@ -1455,41 +1579,128 @@ impl Client {
     }
 }
 
-async fn read_credentials_from_keychain(cx: &AsyncAppContext) -> Option<Credentials> {
-    if IMPERSONATE_LOGIN.is_some() {
-        return None;
-    }
-
-    let (user_id, access_token) = cx
-        .update(|cx| cx.read_credentials(&ClientSettings::get_global(cx).server_url))
-        .log_err()?
-        .await
-        .log_err()??;
-
-    Some(Credentials::User {
-        user_id: user_id.parse().ok()?,
-        access_token: String::from_utf8(access_token).ok()?,
-    })
-}
-
-async fn write_credentials_to_keychain(
+#[derive(Serialize, Deserialize)]
+struct DevelopmentCredentials {
     user_id: u64,
     access_token: String,
-    cx: &AsyncAppContext,
-) -> Result<()> {
-    cx.update(move |cx| {
-        cx.write_credentials(
-            &ClientSettings::get_global(cx).server_url,
-            &user_id.to_string(),
-            access_token.as_bytes(),
-        )
-    })?
-    .await
 }
 
-async fn delete_credentials_from_keychain(cx: &AsyncAppContext) -> Result<()> {
-    cx.update(move |cx| cx.delete_credentials(&ClientSettings::get_global(cx).server_url))?
-        .await
+/// A credentials provider that stores credentials in a local file.
+///
+/// This MUST only be used in development, as this is not a secure way of storing
+/// credentials on user machines.
+///
+/// Its existence is purely to work around the annoyance of having to constantly
+/// re-allow access to the system keychain when developing Zed.
+struct DevelopmentCredentialsProvider {
+    path: PathBuf,
+}
+
+impl CredentialsProvider for DevelopmentCredentialsProvider {
+    fn read_credentials<'a>(
+        &'a self,
+        _cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Option<Credentials>> + 'a>> {
+        async move {
+            if IMPERSONATE_LOGIN.is_some() {
+                return None;
+            }
+
+            let json = std::fs::read(&self.path).log_err()?;
+
+            let credentials: DevelopmentCredentials = serde_json::from_slice(&json).log_err()?;
+
+            Some(Credentials::User {
+                user_id: credentials.user_id,
+                access_token: credentials.access_token,
+            })
+        }
+        .boxed_local()
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        user_id: u64,
+        access_token: String,
+        _cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            let json = serde_json::to_string(&DevelopmentCredentials {
+                user_id,
+                access_token,
+            })?;
+
+            std::fs::write(&self.path, json)?;
+
+            Ok(())
+        }
+        .boxed_local()
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        _cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move { Ok(std::fs::remove_file(&self.path)?) }.boxed_local()
+    }
+}
+
+/// A credentials provider that stores credentials in the system keychain.
+struct KeychainCredentialsProvider;
+
+impl CredentialsProvider for KeychainCredentialsProvider {
+    fn read_credentials<'a>(
+        &'a self,
+        cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Option<Credentials>> + 'a>> {
+        async move {
+            if IMPERSONATE_LOGIN.is_some() {
+                return None;
+            }
+
+            let (user_id, access_token) = cx
+                .update(|cx| cx.read_credentials(&ClientSettings::get_global(cx).server_url))
+                .log_err()?
+                .await
+                .log_err()??;
+
+            Some(Credentials::User {
+                user_id: user_id.parse().ok()?,
+                access_token: String::from_utf8(access_token).ok()?,
+            })
+        }
+        .boxed_local()
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        user_id: u64,
+        access_token: String,
+        cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            cx.update(move |cx| {
+                cx.write_credentials(
+                    &ClientSettings::get_global(cx).server_url,
+                    &user_id.to_string(),
+                    access_token.as_bytes(),
+                )
+            })?
+            .await
+        }
+        .boxed_local()
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        cx: &'a AsyncAppContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            cx.update(move |cx| cx.delete_credentials(&ClientSettings::get_global(cx).server_url))?
+                .await
+        }
+        .boxed_local()
+    }
 }
 
 /// prefix for the zed:// url scheme
@@ -1524,10 +1735,11 @@ mod tests {
 
     use clock::FakeSystemClock;
     use gpui::{BackgroundExecutor, Context, TestAppContext};
+    use http::FakeHttpClient;
     use parking_lot::Mutex;
+    use proto::TypedEnvelope;
     use settings::SettingsStore;
     use std::future;
-    use util::http::FakeHttpClient;
 
     #[gpui::test(iterations = 10)]
     async fn test_reconnection(cx: &mut TestAppContext) {
@@ -1708,7 +1920,7 @@ mod tests {
         let (done_tx1, mut done_rx1) = smol::channel::unbounded();
         let (done_tx2, mut done_rx2) = smol::channel::unbounded();
         client.add_model_message_handler(
-            move |model: Model<TestModel>, _: TypedEnvelope<proto::JoinProject>, _, mut cx| {
+            move |model: Model<TestModel>, _: TypedEnvelope<proto::JoinProject>, mut cx| {
                 match model.update(&mut cx, |model, _| model.id).unwrap() {
                     1 => done_tx1.try_send(()).unwrap(),
                     2 => done_tx2.try_send(()).unwrap(),
@@ -1770,7 +1982,7 @@ mod tests {
         let (done_tx2, mut done_rx2) = smol::channel::unbounded();
         let subscription1 = client.add_message_handler(
             model.downgrade(),
-            move |_, _: TypedEnvelope<proto::Ping>, _, _| {
+            move |_, _: TypedEnvelope<proto::Ping>, _| {
                 done_tx1.try_send(()).unwrap();
                 async { Ok(()) }
             },
@@ -1778,7 +1990,7 @@ mod tests {
         drop(subscription1);
         let _subscription2 = client.add_message_handler(
             model.downgrade(),
-            move |_, _: TypedEnvelope<proto::Ping>, _, _| {
+            move |_, _: TypedEnvelope<proto::Ping>, _| {
                 done_tx2.try_send(()).unwrap();
                 async { Ok(()) }
             },
@@ -1804,7 +2016,7 @@ mod tests {
         let (done_tx, mut done_rx) = smol::channel::unbounded();
         let subscription = client.add_message_handler(
             model.clone().downgrade(),
-            move |model: Model<TestModel>, _: TypedEnvelope<proto::Ping>, _, mut cx| {
+            move |model: Model<TestModel>, _: TypedEnvelope<proto::Ping>, mut cx| {
                 model
                     .update(&mut cx, |model, _| model.subscription.take())
                     .unwrap();

@@ -58,16 +58,42 @@ impl Render for ImageShowcase {
     }
 }
 
+actions!(image, [Quit]);
+
 fn main() {
     env_logger::init();
 
     App::new().run(|cx: &mut AppContext| {
-        cx.open_window(WindowOptions::default(), |cx| {
+        cx.activate(true);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![Menu {
+            name: "Image",
+            items: vec![MenuItem::action("Quit", Quit)],
+        }]);
+
+        let window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from("Image Example")),
+                appears_transparent: false,
+                ..Default::default()
+            }),
+
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                size: size(px(1100.), px(600.)),
+                origin: Point::new(px(200.), px(200.)),
+            })),
+
+            ..Default::default()
+        };
+
+        cx.open_window(window_options, |cx| {
             cx.new_view(|_cx| ImageShowcase {
                 // Relative path to your root project path
                 local_resource: Arc::new(PathBuf::from_str("examples/image/app-icon.png").unwrap()),
                 remote_resource: "https://picsum.photos/512/512".into(),
             })
-        });
+        })
+        .unwrap();
     });
 }

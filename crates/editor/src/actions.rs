@@ -1,5 +1,7 @@
 //! This module contains all actions supported by [`Editor`].
 use super::*;
+use gpui::action_as;
+use util::serde::default_true;
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct SelectNext {
@@ -11,6 +13,12 @@ pub struct SelectNext {
 pub struct SelectPrevious {
     #[serde(default)]
     pub replace_newest: bool,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct MoveToBeginningOfLine {
+    #[serde(default = "default_true")]
+    pub(super) stop_at_soft_wraps: bool,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -32,6 +40,12 @@ pub struct MovePageDown {
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct MoveToEndOfLine {
+    #[serde(default = "default_true")]
+    pub stop_at_soft_wraps: bool,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct SelectToEndOfLine {
     #[serde(default)]
     pub(super) stop_at_soft_wraps: bool,
@@ -39,8 +53,9 @@ pub struct SelectToEndOfLine {
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct ToggleCodeActions {
+    // Display row from which the action was deployed.
     #[serde(default)]
-    pub deployed_from_indicator: bool,
+    pub deployed_from_indicator: Option<DisplayRow>,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -63,12 +78,12 @@ pub struct ToggleComments {
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct FoldAt {
-    pub buffer_row: u32,
+    pub buffer_row: MultiBufferRow,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct UnfoldAt {
-    pub buffer_row: u32,
+    pub buffer_row: MultiBufferRow,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -94,25 +109,54 @@ pub struct SelectDownByLines {
     pub(super) lines: u32,
 }
 
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ExpandExcerpts {
+    #[serde(default)]
+    pub(super) lines: u32,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ExpandExcerptsUp {
+    #[serde(default)]
+    pub(super) lines: u32,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ExpandExcerptsDown {
+    #[serde(default)]
+    pub(super) lines: u32,
+}
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ShowCompletions {
+    #[serde(default)]
+    pub(super) trigger: Option<char>,
+}
+
 impl_actions!(
     editor,
     [
+        ConfirmCodeAction,
+        ConfirmCompletion,
+        ExpandExcerpts,
+        ExpandExcerptsUp,
+        ExpandExcerptsDown,
+        FoldAt,
+        MoveDownByLines,
+        MovePageDown,
+        MovePageUp,
+        MoveToBeginningOfLine,
+        MoveToEndOfLine,
+        MoveUpByLines,
+        SelectDownByLines,
         SelectNext,
         SelectPrevious,
         SelectToBeginningOfLine,
-        MovePageUp,
-        MovePageDown,
         SelectToEndOfLine,
-        ToggleCodeActions,
-        ConfirmCompletion,
-        ConfirmCodeAction,
-        ToggleComments,
-        FoldAt,
-        UnfoldAt,
-        MoveUpByLines,
-        MoveDownByLines,
         SelectUpByLines,
-        SelectDownByLines,
+        ShowCompletions,
+        ToggleCodeActions,
+        ToggleComments,
+        UnfoldAt,
     ]
 );
 
@@ -120,11 +164,13 @@ gpui::actions!(
     editor,
     [
         AcceptPartialCopilotSuggestion,
+        AcceptInlineCompletion,
         AcceptPartialInlineCompletion,
         AddSelectionAbove,
         AddSelectionBelow,
         Backspace,
         Cancel,
+        CancelLanguageServerWork,
         ConfirmRename,
         ContextMenuFirst,
         ContextMenuLast,
@@ -133,6 +179,7 @@ gpui::actions!(
         ConvertToKebabCase,
         ConvertToLowerCamelCase,
         ConvertToLowerCase,
+        ConvertToOppositeCase,
         ConvertToSnakeCase,
         ConvertToTitleCase,
         ConvertToUpperCamelCase,
@@ -153,8 +200,9 @@ gpui::actions!(
         DeleteToPreviousSubwordStart,
         DeleteToPreviousWordStart,
         DisplayCursorNames,
-        DuplicateLineUp,
         DuplicateLineDown,
+        DuplicateLineUp,
+        ExpandAllHunkDiffs,
         ExpandMacroRecursively,
         FindAllReferences,
         Fold,
@@ -183,10 +231,8 @@ gpui::actions!(
         MoveLineUp,
         MoveRight,
         MoveToBeginning,
-        MoveToBeginningOfLine,
         MoveToEnclosingBracket,
         MoveToEnd,
-        MoveToEndOfLine,
         MoveToEndOfParagraph,
         MoveToNextSubwordEnd,
         MoveToNextWordEnd,
@@ -222,6 +268,7 @@ gpui::actions!(
         SelectAllMatches,
         SelectDown,
         SelectLargerSyntaxNode,
+        SelectEnclosingSymbol,
         SelectLeft,
         SelectLine,
         SelectRight,
@@ -235,8 +282,9 @@ gpui::actions!(
         SelectToPreviousWordStart,
         SelectToStartOfParagraph,
         SelectUp,
+        SelectPageDown,
+        SelectPageUp,
         ShowCharacterPalette,
-        ShowCompletions,
         ShowInlineCompletion,
         ShuffleLines,
         SortLinesCaseInsensitive,
@@ -245,14 +293,23 @@ gpui::actions!(
         Tab,
         TabPrev,
         ToggleGitBlame,
+        ToggleGitBlameInline,
+        ToggleSelectionMenu,
+        ToggleHunkDiff,
         ToggleInlayHints,
         ToggleLineNumbers,
+        ToggleIndentGuides,
         ToggleSoftWrap,
+        ToggleTabBar,
         Transpose,
         Undo,
         UndoSelection,
         UnfoldLines,
+        UniqueLinesCaseInsensitive,
         UniqueLinesCaseSensitive,
-        UniqueLinesCaseInsensitive
     ]
 );
+
+action_as!(outline, ToggleOutline as Toggle);
+
+action_as!(go_to_line, ToggleGoToLine as Toggle);

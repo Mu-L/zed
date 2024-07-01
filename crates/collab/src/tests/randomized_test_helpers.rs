@@ -69,7 +69,6 @@ struct TestPlan<T: RandomizedTest> {
 pub struct UserTestPlan {
     pub user_id: UserId,
     pub username: String,
-    pub allow_client_reconnection: bool,
     pub allow_client_disconnection: bool,
     next_root_id: usize,
     operation_ix: usize,
@@ -237,7 +236,6 @@ impl<T: RandomizedTest> TestPlan<T> {
                 next_root_id: 0,
                 operation_ix: 0,
                 allow_client_disconnection,
-                allow_client_reconnection,
             });
         }
 
@@ -533,7 +531,7 @@ impl<T: RandomizedTest> TestPlan<T> {
                 deterministic.finish_waiting();
                 server.allow_connections();
 
-                for project in client.remote_projects().iter() {
+                for project in client.dev_server_projects().iter() {
                     project.read_with(&client_cx, |project, _| {
                         assert!(
                             project.is_disconnected(),

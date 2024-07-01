@@ -15,14 +15,20 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 use telemetry_events::{
-    ActionEvent, AppEvent, AssistantEvent, CallEvent, CopilotEvent, CpuEvent, EditEvent,
-    EditorEvent, Event, EventRequestBody, EventWrapper, ExtensionEvent, MemoryEvent, SettingEvent,
+    ActionEvent, AppEvent, AssistantEvent, CallEvent, CpuEvent, EditEvent, EditorEvent, Event,
+    EventRequestBody, EventWrapper, ExtensionEvent, InlineCompletionEvent, MemoryEvent,
+    SettingEvent,
 };
+use uuid::Uuid;
+
+static CRASH_REPORTS_BUCKET: &str = "zed-crash-reports";
 
 pub fn router() -> Router {
     Router::new()
         .route("/telemetry/events", post(post_events))
         .route("/telemetry/crashes", post(post_crash))
+        .route("/telemetry/panics", post(post_panic))
+        .route("/telemetry/hangs", post(post_hang))
 }
 
 pub struct ZedChecksumHeader(Vec<u8>);
@@ -85,8 +91,6 @@ pub async fn post_crash(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<()> {
-    static CRASH_REPORTS_BUCKET: &str = "zed-crash-reports";
-
     let report = IpsFile::parse(&body)?;
     let version_threshold = SemanticVersion::new(0, 123, 0);
 
@@ -136,6 +140,13 @@ pub async fn post_crash(
         .get("x-zed-panicked-on")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse().ok());
+
+    let installation_id = headers
+        .get("x-zed-installation-id")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
     let mut recent_panic = None;
 
     if let Some(recent_panic_on) = recent_panic_on {
@@ -160,6 +171,7 @@ pub async fn post_crash(
         os_version = %report.header.os_version,
         bundle_id = %report.header.bundle_id,
         incident_id = %report.header.incident_id,
+        installation_id = %installation_id,
         description = %description,
         backtrace = %summary,
         "crash report");
@@ -214,6 +226,161 @@ pub async fn post_crash(
     Ok(())
 }
 
+pub async fn post_hang(
+    Extension(app): Extension<Arc<AppState>>,
+    TypedHeader(ZedChecksumHeader(checksum)): TypedHeader<ZedChecksumHeader>,
+    body: Bytes,
+) -> Result<()> {
+    let Some(expected) = calculate_json_checksum(app.clone(), &body) else {
+        return Err(Error::Http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "events not enabled".into(),
+        ))?;
+    };
+
+    if checksum != expected {
+        return Err(Error::Http(
+            StatusCode::BAD_REQUEST,
+            "invalid checksum".into(),
+        ))?;
+    }
+
+    let incident_id = Uuid::new_v4().to_string();
+
+    // dump JSON into S3 so we can get frame offsets if we need to.
+    if let Some(blob_store_client) = app.blob_store_client.as_ref() {
+        blob_store_client
+            .put_object()
+            .bucket(CRASH_REPORTS_BUCKET)
+            .key(incident_id.clone() + ".hang.json")
+            .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .map_err(|e| log::error!("Failed to upload crash: {}", e))
+            .ok();
+    }
+
+    let report: telemetry_events::HangReport = serde_json::from_slice(&body).map_err(|err| {
+        log::error!("can't parse report json: {err}");
+        Error::Internal(anyhow!(err))
+    })?;
+
+    let mut backtrace = "Possible hang detected on main thread:".to_string();
+    let unknown = "<unknown>".to_string();
+    for frame in report.backtrace.iter() {
+        backtrace.push_str(&format!("\n{}", frame.symbols.first().unwrap_or(&unknown)));
+    }
+
+    tracing::error!(
+        service = "client",
+        version = %report.app_version.unwrap_or_default().to_string(),
+        os_name = %report.os_name,
+        os_version = report.os_version.unwrap_or_default().to_string(),
+        incident_id = %incident_id,
+        installation_id = %report.installation_id.unwrap_or_default(),
+        backtrace = %backtrace,
+        "hang report");
+
+    Ok(())
+}
+
+pub async fn post_panic(
+    Extension(app): Extension<Arc<AppState>>,
+    TypedHeader(ZedChecksumHeader(checksum)): TypedHeader<ZedChecksumHeader>,
+    body: Bytes,
+) -> Result<()> {
+    let Some(expected) = calculate_json_checksum(app.clone(), &body) else {
+        return Err(Error::Http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "events not enabled".into(),
+        ))?;
+    };
+
+    if checksum != expected {
+        return Err(Error::Http(
+            StatusCode::BAD_REQUEST,
+            "invalid checksum".into(),
+        ))?;
+    }
+
+    let report: telemetry_events::PanicRequest = serde_json::from_slice(&body)
+        .map_err(|_| Error::Http(StatusCode::BAD_REQUEST, "invalid json".into()))?;
+    let panic = report.panic;
+
+    if panic.os_name == "Linux" && panic.os_version == Some("1.0.0".to_string()) {
+        return Err(Error::Http(
+            StatusCode::BAD_REQUEST,
+            "invalid os version".into(),
+        ))?;
+    }
+
+    tracing::error!(
+        service = "client",
+        version = %panic.app_version,
+        os_name = %panic.os_name,
+        os_version = %panic.os_version.clone().unwrap_or_default(),
+        installation_id = %panic.installation_id.unwrap_or_default(),
+        description = %panic.payload,
+        backtrace = %panic.backtrace.join("\n"),
+        "panic report");
+
+    let backtrace = if panic.backtrace.len() > 25 {
+        let total = panic.backtrace.len();
+        format!(
+            "{}\n   and {} more",
+            panic
+                .backtrace
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            total - 20
+        )
+    } else {
+        panic.backtrace.join("\n")
+    };
+    let backtrace_with_summary = panic.payload + "\n" + &backtrace;
+
+    if let Some(slack_panics_webhook) = app.config.slack_panics_webhook.clone() {
+        let payload = slack::WebhookBody::new(|w| {
+            w.add_section(|s| s.text(slack::Text::markdown("Panic request".to_string())))
+                .add_section(|s| {
+                    s.add_field(slack::Text::markdown(format!(
+                        "*Version:*\n {} ",
+                        panic.app_version
+                    )))
+                    .add_field({
+                        slack::Text::markdown(format!(
+                            "*OS:*\n{} {}",
+                            panic.os_name,
+                            panic.os_version.unwrap_or_default()
+                        ))
+                    })
+                })
+                .add_rich_text(|r| r.add_preformatted(|p| p.add_text(backtrace_with_summary)))
+        });
+        let payload_json = serde_json::to_string(&payload).map_err(|err| {
+            log::error!("Failed to serialize payload to JSON: {err}");
+            Error::Internal(anyhow!(err))
+        })?;
+
+        reqwest::Client::new()
+            .post(slack_panics_webhook)
+            .header("Content-Type", "application/json")
+            .body(payload_json)
+            .send()
+            .await
+            .map_err(|err| {
+                log::error!("Failed to send payload to Slack: {err}");
+                Error::Internal(anyhow!(err))
+            })?;
+    }
+
+    Ok(())
+}
+
 pub async fn post_events(
     Extension(app): Extension<Arc<AppState>>,
     TypedHeader(ZedChecksumHeader(checksum)): TypedHeader<ZedChecksumHeader>,
@@ -227,24 +394,14 @@ pub async fn post_events(
         ))?
     };
 
-    let Some(checksum_seed) = app.config.zed_client_checksum_seed.as_ref() else {
+    let Some(expected) = calculate_json_checksum(app.clone(), &body) else {
         return Err(Error::Http(
             StatusCode::INTERNAL_SERVER_ERROR,
             "events not enabled".into(),
         ))?;
     };
 
-    let mut summer = Sha256::new();
-    summer.update(checksum_seed);
-    summer.update(&body);
-    summer.update(checksum_seed);
-
-    if &checksum != &summer.finalize()[..] {
-        return Err(Error::Http(
-            StatusCode::BAD_REQUEST,
-            "invalid checksum".into(),
-        ))?;
-    }
+    let checksum_matched = checksum == expected;
 
     let request_body: telemetry_events::EventRequestBody =
         serde_json::from_slice(&body).map_err(|err| {
@@ -269,19 +426,28 @@ pub async fn post_events(
                 &request_body,
                 first_event_at,
                 country_code.clone(),
+                checksum_matched,
             )),
-            Event::Copilot(event) => to_upload.copilot_events.push(CopilotEventRow::from_event(
-                event.clone(),
-                &wrapper,
-                &request_body,
-                first_event_at,
-                country_code.clone(),
-            )),
+            // Needed for clients sending old copilot_event types
+            Event::Copilot(_) => {}
+            Event::InlineCompletion(event) => {
+                to_upload
+                    .inline_completion_events
+                    .push(InlineCompletionEventRow::from_event(
+                        event.clone(),
+                        &wrapper,
+                        &request_body,
+                        first_event_at,
+                        country_code.clone(),
+                        checksum_matched,
+                    ))
+            }
             Event::Call(event) => to_upload.call_events.push(CallEventRow::from_event(
                 event.clone(),
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::Assistant(event) => {
                 to_upload
@@ -291,6 +457,7 @@ pub async fn post_events(
                         &wrapper,
                         &request_body,
                         first_event_at,
+                        checksum_matched,
                     ))
             }
             Event::Cpu(event) => to_upload.cpu_events.push(CpuEventRow::from_event(
@@ -298,36 +465,42 @@ pub async fn post_events(
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::Memory(event) => to_upload.memory_events.push(MemoryEventRow::from_event(
                 event.clone(),
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::App(event) => to_upload.app_events.push(AppEventRow::from_event(
                 event.clone(),
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::Setting(event) => to_upload.setting_events.push(SettingEventRow::from_event(
                 event.clone(),
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::Edit(event) => to_upload.edit_events.push(EditEventRow::from_event(
                 event.clone(),
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::Action(event) => to_upload.action_events.push(ActionEventRow::from_event(
                 event.clone(),
                 &wrapper,
                 &request_body,
                 first_event_at,
+                checksum_matched,
             )),
             Event::Extension(event) => {
                 let metadata = app
@@ -342,6 +515,7 @@ pub async fn post_events(
                         &request_body,
                         metadata,
                         first_event_at,
+                        checksum_matched,
                     ))
             }
         }
@@ -358,7 +532,7 @@ pub async fn post_events(
 #[derive(Default)]
 struct ToUpload {
     editor_events: Vec<EditorEventRow>,
-    copilot_events: Vec<CopilotEventRow>,
+    inline_completion_events: Vec<InlineCompletionEventRow>,
     assistant_events: Vec<AssistantEventRow>,
     call_events: Vec<CallEventRow>,
     cpu_events: Vec<CpuEventRow>,
@@ -377,14 +551,14 @@ impl ToUpload {
             .await
             .with_context(|| format!("failed to upload to table '{EDITOR_EVENTS_TABLE}'"))?;
 
-        const COPILOT_EVENTS_TABLE: &str = "copilot_events";
+        const INLINE_COMPLETION_EVENTS_TABLE: &str = "inline_completion_events";
         Self::upload_to_table(
-            COPILOT_EVENTS_TABLE,
-            &self.copilot_events,
+            INLINE_COMPLETION_EVENTS_TABLE,
+            &self.inline_completion_events,
             clickhouse_client,
         )
         .await
-        .with_context(|| format!("failed to upload to table '{COPILOT_EVENTS_TABLE}'"))?;
+        .with_context(|| format!("failed to upload to table '{INLINE_COMPLETION_EVENTS_TABLE}'"))?;
 
         const ASSISTANT_EVENTS_TABLE: &str = "assistant_events";
         Self::upload_to_table(
@@ -484,34 +658,36 @@ where
 
     let country_code = country_code.as_bytes();
 
-    serializer.serialize_u16(((country_code[0] as u16) << 8) + country_code[1] as u16)
+    serializer.serialize_u16(((country_code[1] as u16) << 8) + country_code[0] as u16)
 }
 
 #[derive(Serialize, Debug, clickhouse::Row)]
 pub struct EditorEventRow {
-    pub installation_id: String,
-    pub operation: String,
-    pub app_version: String,
-    pub file_extension: String,
-    pub os_name: String,
-    pub os_version: String,
-    pub release_channel: String,
-    pub signed_in: bool,
-    pub vim_mode: bool,
+    installation_id: String,
+    metrics_id: String,
+    operation: String,
+    app_version: String,
+    file_extension: String,
+    os_name: String,
+    os_version: String,
+    release_channel: String,
+    signed_in: bool,
+    vim_mode: bool,
     #[serde(serialize_with = "serialize_country_code")]
-    pub country_code: String,
-    pub region_code: String,
-    pub city: String,
-    pub time: i64,
-    pub copilot_enabled: bool,
-    pub copilot_enabled_for_language: bool,
-    pub historical_event: bool,
-    pub architecture: String,
-    pub is_staff: Option<bool>,
-    pub session_id: Option<String>,
-    pub major: Option<i32>,
-    pub minor: Option<i32>,
-    pub patch: Option<i32>,
+    country_code: String,
+    region_code: String,
+    city: String,
+    time: i64,
+    copilot_enabled: bool,
+    copilot_enabled_for_language: bool,
+    historical_event: bool,
+    architecture: String,
+    is_staff: Option<bool>,
+    session_id: Option<String>,
+    major: Option<i32>,
+    minor: Option<i32>,
+    patch: Option<i32>,
+    checksum_matched: bool,
 }
 
 impl EditorEventRow {
@@ -521,6 +697,7 @@ impl EditorEventRow {
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
         country_code: Option<String>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -531,11 +708,13 @@ impl EditorEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
             architecture: body.architecture.clone(),
             installation_id: body.installation_id.clone().unwrap_or_default(),
+            metrics_id: body.metrics_id.clone().unwrap_or_default(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
             time: time.timestamp_millis(),
@@ -554,35 +733,37 @@ impl EditorEventRow {
 }
 
 #[derive(Serialize, Debug, clickhouse::Row)]
-pub struct CopilotEventRow {
-    pub installation_id: String,
-    pub suggestion_id: String,
-    pub suggestion_accepted: bool,
-    pub app_version: String,
-    pub file_extension: String,
-    pub os_name: String,
-    pub os_version: String,
-    pub release_channel: String,
-    pub signed_in: bool,
+pub struct InlineCompletionEventRow {
+    installation_id: String,
+    provider: String,
+    suggestion_accepted: bool,
+    app_version: String,
+    file_extension: String,
+    os_name: String,
+    os_version: String,
+    release_channel: String,
+    signed_in: bool,
     #[serde(serialize_with = "serialize_country_code")]
-    pub country_code: String,
-    pub region_code: String,
-    pub city: String,
-    pub time: i64,
-    pub is_staff: Option<bool>,
-    pub session_id: Option<String>,
-    pub major: Option<i32>,
-    pub minor: Option<i32>,
-    pub patch: Option<i32>,
+    country_code: String,
+    region_code: String,
+    city: String,
+    time: i64,
+    is_staff: Option<bool>,
+    session_id: Option<String>,
+    major: Option<i32>,
+    minor: Option<i32>,
+    patch: Option<i32>,
+    checksum_matched: bool,
 }
 
-impl CopilotEventRow {
+impl InlineCompletionEventRow {
     fn from_event(
-        event: CopilotEvent,
+        event: InlineCompletionEvent,
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
         country_code: Option<String>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -593,6 +774,7 @@ impl CopilotEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
@@ -605,7 +787,7 @@ impl CopilotEventRow {
             country_code: country_code.unwrap_or("XX".to_string()),
             region_code: "".to_string(),
             city: "".to_string(),
-            suggestion_id: event.suggestion_id.unwrap_or_default(),
+            provider: event.provider,
             suggestion_accepted: event.suggestion_accepted,
         }
     }
@@ -619,6 +801,9 @@ pub struct CallEventRow {
     minor: Option<i32>,
     patch: Option<i32>,
     release_channel: String,
+    os_name: String,
+    os_version: String,
+    checksum_matched: bool,
 
     // ClientEventBase
     installation_id: String,
@@ -638,6 +823,7 @@ impl CallEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -648,7 +834,10 @@ impl CallEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone().unwrap_or_default(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -667,7 +856,10 @@ pub struct AssistantEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -679,6 +871,8 @@ pub struct AssistantEventRow {
     conversation_id: String,
     kind: String,
     model: String,
+    response_latency_in_ms: Option<i64>,
+    error_message: Option<String>,
 }
 
 impl AssistantEventRow {
@@ -687,6 +881,7 @@ impl AssistantEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -697,7 +892,10 @@ impl AssistantEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -705,24 +903,31 @@ impl AssistantEventRow {
             conversation_id: event.conversation_id.unwrap_or_default(),
             kind: event.kind.to_string(),
             model: event.model,
+            response_latency_in_ms: event
+                .response_latency
+                .map(|latency| latency.as_millis() as i64),
+            error_message: event.error_message,
         }
     }
 }
 
 #[derive(Debug, clickhouse::Row, Serialize)]
 pub struct CpuEventRow {
-    pub installation_id: Option<String>,
-    pub is_staff: Option<bool>,
-    pub usage_as_percentage: f32,
-    pub core_count: u32,
-    pub app_version: String,
-    pub release_channel: String,
-    pub time: i64,
-    pub session_id: Option<String>,
+    installation_id: Option<String>,
+    is_staff: Option<bool>,
+    usage_as_percentage: f32,
+    core_count: u32,
+    app_version: String,
+    release_channel: String,
+    os_name: String,
+    os_version: String,
+    time: i64,
+    session_id: Option<String>,
     // pub normalized_cpu_usage: f64, MATERIALIZED
-    pub major: Option<i32>,
-    pub minor: Option<i32>,
-    pub patch: Option<i32>,
+    major: Option<i32>,
+    minor: Option<i32>,
+    patch: Option<i32>,
+    checksum_matched: bool,
 }
 
 impl CpuEventRow {
@@ -731,6 +936,7 @@ impl CpuEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -741,7 +947,10 @@ impl CpuEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -759,7 +968,10 @@ pub struct MemoryEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -778,6 +990,7 @@ impl MemoryEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -788,7 +1001,10 @@ impl MemoryEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -806,7 +1022,10 @@ pub struct AppEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -824,6 +1043,7 @@ impl AppEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -834,7 +1054,10 @@ impl AppEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -851,7 +1074,10 @@ pub struct SettingEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -869,6 +1095,7 @@ impl SettingEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -878,8 +1105,11 @@ impl SettingEventRow {
             app_version: body.app_version.clone(),
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
+            checksum_matched,
             patch: semver.map(|v| v.patch() as i32),
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -897,7 +1127,10 @@ pub struct ExtensionEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -920,6 +1153,7 @@ impl ExtensionEventRow {
         body: &EventRequestBody,
         extension_metadata: Option<ExtensionMetadata>,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -930,7 +1164,10 @@ impl ExtensionEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -959,7 +1196,10 @@ pub struct EditEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -981,6 +1221,7 @@ impl EditEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -994,7 +1235,10 @@ impl EditEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -1013,7 +1257,10 @@ pub struct ActionEventRow {
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
+    checksum_matched: bool,
     release_channel: String,
+    os_name: String,
+    os_version: String,
 
     // ClientEventBase
     installation_id: Option<String>,
@@ -1033,6 +1280,7 @@ impl ActionEventRow {
         wrapper: &EventWrapper,
         body: &EventRequestBody,
         first_event_at: chrono::DateTime<chrono::Utc>,
+        checksum_matched: bool,
     ) -> Self {
         let semver = body.semver();
         let time =
@@ -1043,7 +1291,10 @@ impl ActionEventRow {
             major: semver.map(|v| v.major() as i32),
             minor: semver.map(|v| v.minor() as i32),
             patch: semver.map(|v| v.patch() as i32),
+            checksum_matched,
             release_channel: body.release_channel.clone().unwrap_or_default(),
+            os_name: body.os_name.clone(),
+            os_version: body.os_version.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -1052,4 +1303,16 @@ impl ActionEventRow {
             action: event.action,
         }
     }
+}
+
+pub fn calculate_json_checksum(app: Arc<AppState>, json: &impl AsRef<[u8]>) -> Option<Vec<u8>> {
+    let Some(checksum_seed) = app.config.zed_client_checksum_seed.as_ref() else {
+        return None;
+    };
+
+    let mut summer = Sha256::new();
+    summer.update(checksum_seed);
+    summer.update(&json);
+    summer.update(checksum_seed);
+    Some(summer.finalize().into_iter().collect())
 }

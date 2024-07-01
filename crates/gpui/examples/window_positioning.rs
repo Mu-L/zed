@@ -24,26 +24,23 @@ fn main() {
 
         for screen in cx.displays() {
             let options = {
-                let popup_margin_width = DevicePixels::from(16);
-                let popup_margin_height = DevicePixels::from(-0) - DevicePixels::from(48);
+                let margin_right = px(16.);
+                let margin_height = px(-48.);
 
-                let window_size = Size {
+                let size = Size {
                     width: px(400.),
                     height: px(72.),
                 };
 
-                let screen_bounds = screen.bounds();
-                let size: Size<DevicePixels> = window_size.into();
-
-                let bounds = gpui::Bounds::<DevicePixels> {
-                    origin: screen_bounds.upper_right()
-                        - point(size.width + popup_margin_width, popup_margin_height),
-                    size: window_size.into(),
+                let bounds = gpui::Bounds::<Pixels> {
+                    origin: screen.bounds().upper_right()
+                        - point(size.width + margin_right, margin_height),
+                    size,
                 };
 
                 WindowOptions {
                     // Set the bounds of the window in screen coordinates
-                    bounds: Some(bounds),
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
                     // Specify the display_id to ensure the window is created on the correct screen
                     display_id: Some(screen.id()),
 
@@ -53,7 +50,8 @@ fn main() {
                     show: true,
                     kind: WindowKind::PopUp,
                     is_movable: false,
-                    fullscreen: false,
+                    app_id: None,
+                    window_min_size: None,
                 }
             };
 
@@ -61,7 +59,8 @@ fn main() {
                 cx.new_view(|_| WindowContent {
                     text: format!("{:?}", screen.id()).into(),
                 })
-            });
+            })
+            .unwrap();
         }
     });
 }

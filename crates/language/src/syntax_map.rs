@@ -1,10 +1,11 @@
 #[cfg(test)]
 mod syntax_map_tests;
 
-use crate::{Grammar, InjectionConfig, Language, LanguageId, LanguageRegistry};
+use crate::{
+    with_parser, Grammar, InjectionConfig, Language, LanguageId, LanguageRegistry, QUERY_CURSORS,
+};
 use collections::HashMap;
 use futures::FutureExt;
-use parking_lot::Mutex;
 use std::{
     borrow::Cow,
     cmp::{self, Ordering, Reverse},
@@ -16,10 +17,6 @@ use std::{
 use sum_tree::{Bias, SeekTarget, SumTree};
 use text::{Anchor, BufferSnapshot, OffsetRangeExt, Point, Rope, ToOffset, ToPoint};
 use tree_sitter::{Node, Query, QueryCapture, QueryCaptures, QueryCursor, QueryMatches, Tree};
-
-use super::PARSER;
-
-static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
 
 #[derive(Default)]
 pub struct SyntaxMap {
@@ -51,7 +48,6 @@ pub struct SyntaxMapMatches<'a> {
 
 #[derive(Debug)]
 pub struct SyntaxMapCapture<'a> {
-    pub depth: usize,
     pub node: Node<'a>,
     pub index: u32,
     pub grammar_index: usize,
@@ -59,6 +55,7 @@ pub struct SyntaxMapCapture<'a> {
 
 #[derive(Debug)]
 pub struct SyntaxMapMatch<'a> {
+    pub language: Arc<Language>,
     pub depth: usize,
     pub pattern_index: usize,
     pub captures: &'a [QueryCapture<'a>],
@@ -74,6 +71,7 @@ struct SyntaxMapCapturesLayer<'a> {
 }
 
 struct SyntaxMapMatchesLayer<'a> {
+    language: Arc<Language>,
     depth: usize,
     next_pattern_index: usize,
     next_captures: Vec<QueryCapture<'a>>,
@@ -211,7 +209,7 @@ struct TextProvider<'a>(&'a Rope);
 
 struct ByteChunks<'a>(text::Chunks<'a>);
 
-struct QueryCursorHandle(Option<QueryCursor>);
+pub(crate) struct QueryCursorHandle(Option<QueryCursor>);
 
 impl SyntaxMap {
     pub fn new() -> Self {
@@ -606,13 +604,21 @@ impl SyntaxSnapshot {
                             LogIncludedRanges(&included_ranges),
                         );
 
-                        tree = parse_text(
+                        let result = parse_text(
                             grammar,
                             text.as_rope(),
                             step_start_byte,
                             included_ranges,
                             Some(old_tree.clone()),
                         );
+                        match result {
+                            Ok(t) => tree = t,
+                            Err(e) => {
+                                log::error!("error parsing text: {:?}", e);
+                                continue;
+                            }
+                        };
+
                         changed_ranges = join_ranges(
                             invalidated_ranges
                                 .iter()
@@ -651,13 +657,20 @@ impl SyntaxSnapshot {
                             LogIncludedRanges(&included_ranges),
                         );
 
-                        tree = parse_text(
+                        let result = parse_text(
                             grammar,
                             text.as_rope(),
                             step_start_byte,
                             included_ranges,
                             None,
                         );
+                        match result {
+                            Ok(t) => tree = t,
+                            Err(e) => {
+                                log::error!("error parsing text: {:?}", e);
+                                continue;
+                            }
+                        };
                         changed_ranges = vec![step_start_byte..step_end_byte];
                     }
 
@@ -872,7 +885,9 @@ impl<'a> SyntaxMapCaptures<'a> {
 
             // TODO - add a Tree-sitter API to remove the need for this.
             let cursor = unsafe {
-                std::mem::transmute::<_, &'static mut QueryCursor>(query_cursor.deref_mut())
+                std::mem::transmute::<&mut tree_sitter::QueryCursor, &'static mut QueryCursor>(
+                    query_cursor.deref_mut(),
+                )
             };
 
             cursor.set_byte_range(range.clone());
@@ -919,7 +934,6 @@ impl<'a> SyntaxMapCaptures<'a> {
         let layer = self.layers[..self.active_layer_count].first()?;
         let capture = layer.next_capture?;
         Some(SyntaxMapCapture {
-            depth: layer.depth,
             grammar_index: layer.grammar_index,
             index: capture.index,
             node: capture.node,
@@ -990,7 +1004,9 @@ impl<'a> SyntaxMapMatches<'a> {
 
             // TODO - add a Tree-sitter API to remove the need for this.
             let cursor = unsafe {
-                std::mem::transmute::<_, &'static mut QueryCursor>(query_cursor.deref_mut())
+                std::mem::transmute::<&mut tree_sitter::QueryCursor, &'static mut QueryCursor>(
+                    query_cursor.deref_mut(),
+                )
             };
 
             cursor.set_byte_range(range.clone());
@@ -1004,6 +1020,7 @@ impl<'a> SyntaxMapMatches<'a> {
                     result.grammars.len() - 1
                 });
             let mut layer = SyntaxMapMatchesLayer {
+                language: layer.language.clone(),
                 depth: layer.depth,
                 grammar_index,
                 matches,
@@ -1036,10 +1053,13 @@ impl<'a> SyntaxMapMatches<'a> {
 
     pub fn peek(&self) -> Option<SyntaxMapMatch> {
         let layer = self.layers.first()?;
+
         if !layer.has_next {
             return None;
         }
+
         Some(SyntaxMapMatch {
+            language: layer.language.clone(),
             depth: layer.depth,
             grammar_index: layer.grammar_index,
             pattern_index: layer.next_pattern_index,
@@ -1161,16 +1181,11 @@ fn parse_text(
     start_byte: usize,
     ranges: Vec<tree_sitter::Range>,
     old_tree: Option<Tree>,
-) -> Tree {
-    PARSER.with(|parser| {
-        let mut parser = parser.borrow_mut();
+) -> anyhow::Result<Tree> {
+    with_parser(|parser| {
         let mut chunks = text.chunks_in_range(start_byte..text.len());
-        parser
-            .set_included_ranges(&ranges)
-            .expect("overlapping ranges");
-        parser
-            .set_language(&grammar.ts_language)
-            .expect("incompatible grammar");
+        parser.set_included_ranges(&ranges)?;
+        parser.set_language(&grammar.ts_language)?;
         parser
             .parse_with(
                 &mut move |offset, _| {
@@ -1179,7 +1194,7 @@ fn parse_text(
                 },
                 old_tree.as_ref(),
             )
-            .expect("invalid language")
+            .ok_or_else(|| anyhow::anyhow!("failed to parse"))
     })
 }
 
@@ -1728,7 +1743,7 @@ impl<'a> Iterator for ByteChunks<'a> {
 }
 
 impl QueryCursorHandle {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let mut cursor = QUERY_CURSORS.lock().pop().unwrap_or_else(QueryCursor::new);
         cursor.set_match_limit(64);
         QueryCursorHandle(Some(cursor))
