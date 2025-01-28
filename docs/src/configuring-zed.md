@@ -714,7 +714,8 @@ List of `string` values
 ```json
 "tab_bar": {
   "show": true,
-  "show_nav_history_buttons": true
+  "show_nav_history_buttons": true,
+  "show_tab_bar_buttons": true
 }
 ```
 
@@ -732,6 +733,16 @@ List of `string` values
 
 - Description: Whether or not to show the navigation history buttons.
 - Setting: `show_nav_history_buttons`
+- Default: `true`
+
+**Options**
+
+`boolean` values
+
+### Tab Bar Buttons
+
+- Description: Whether or not to show the tab bar buttons.
+- Setting: `show_tab_bar_buttons`
 - Default: `true`
 
 **Options**
@@ -1764,7 +1775,10 @@ List of `integer` column numbers
     "toolbar": {
       "breadcrumbs": true
     },
-    "working_directory": "current_project_directory"
+    "working_directory": "current_project_directory",
+    "scrollbar": {
+      "show": null
+    }
   }
 }
 ```

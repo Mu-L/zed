@@ -18,15 +18,15 @@ use futures::{
     FutureExt as _, Stream, StreamExt,
 };
 use fuzzy::CharBag;
-use git::GitHostingProviderRegistry;
 use git::{
-    repository::{GitFileStatus, GitRepository, RepoPath},
-    status::GitStatusPair,
-    COOKIES, DOT_GIT, FSMONITOR_DAEMON, GITIGNORE,
+    repository::{GitRepository, RepoPath},
+    status::{
+        FileStatus, GitSummary, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode,
+    },
+    GitHostingProviderRegistry, COOKIES, DOT_GIT, FSMONITOR_DAEMON, GITIGNORE,
 };
 use gpui::{
-    AppContext, AsyncAppContext, BackgroundExecutor, Context, EventEmitter, Model, ModelContext,
-    Task,
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Task,
 };
 use ignore::IgnoreStack;
 use language::DiskState;
@@ -117,7 +117,7 @@ pub struct LoadedBinaryFile {
 pub struct LocalWorktree {
     snapshot: LocalSnapshot,
     scan_requests_tx: channel::Sender<ScanRequest>,
-    path_prefixes_to_scan_tx: channel::Sender<Arc<Path>>,
+    path_prefixes_to_scan_tx: channel::Sender<PathPrefixScanRequest>,
     is_scanning: (watch::Sender<bool>, watch::Receiver<bool>),
     _background_scanner_tasks: Vec<Task<()>>,
     update_observer: Option<UpdateObservationState>,
@@ -127,6 +127,11 @@ pub struct LocalWorktree {
     next_entry_id: Arc<AtomicUsize>,
     settings: WorktreeSettings,
     share_private_files: bool,
+}
+
+pub struct PathPrefixScanRequest {
+    path: Arc<Path>,
+    done: SmallVec<[barrier::Sender; 1]>,
 }
 
 struct ScanRequest {
@@ -226,6 +231,14 @@ impl RepositoryEntry {
         self.statuses_by_path.iter().cloned()
     }
 
+    pub fn status_len(&self) -> usize {
+        self.statuses_by_path.summary().item_summary.count
+    }
+
+    pub fn status_summary(&self) -> GitSummary {
+        self.statuses_by_path.summary().item_summary
+    }
+
     pub fn status_for_path(&self, path: &RepoPath) -> Option<StatusEntry> {
         self.statuses_by_path
             .get(&PathKey(path.0.clone()), &())
@@ -239,10 +252,7 @@ impl RepositoryEntry {
             updated_statuses: self
                 .statuses_by_path
                 .iter()
-                .map(|entry| proto::StatusEntry {
-                    repo_path: entry.repo_path.to_string_lossy().to_string(),
-                    status: status_pair_to_proto(entry.status.clone()),
-                })
+                .map(|entry| entry.to_proto())
                 .collect(),
             removed_statuses: Default::default(),
         }
@@ -266,7 +276,7 @@ impl RepositoryEntry {
                             current_new_entry = new_statuses.next();
                         }
                         Ordering::Equal => {
-                            if new_entry.combined_status() != old_entry.combined_status() {
+                            if new_entry.status != old_entry.status {
                                 updated_statuses.push(new_entry.to_proto());
                             }
                             current_old_entry = old_statuses.next();
@@ -539,8 +549,8 @@ impl Worktree {
         visible: bool,
         fs: Arc<dyn Fs>,
         next_entry_id: Arc<AtomicUsize>,
-        cx: &mut AsyncAppContext,
-    ) -> Result<Model<Self>> {
+        cx: &mut AsyncApp,
+    ) -> Result<Entity<Self>> {
         let abs_path = path.into();
         let metadata = fs
             .metadata(&abs_path)
@@ -556,7 +566,7 @@ impl Worktree {
 
         let root_file_handle = fs.open_handle(&abs_path).await.log_err();
 
-        cx.new_model(move |cx: &mut ModelContext<Worktree>| {
+        cx.new(move |cx: &mut Context<Worktree>| {
             let mut snapshot = LocalSnapshot {
                 ignores_by_parent_abs_path: Default::default(),
                 git_repositories: Default::default(),
@@ -630,9 +640,9 @@ impl Worktree {
         replica_id: ReplicaId,
         worktree: proto::WorktreeMetadata,
         client: AnyProtoClient,
-        cx: &mut AppContext,
-    ) -> Model<Self> {
-        cx.new_model(|cx: &mut ModelContext<Self>| {
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx: &mut Context<Self>| {
             let snapshot = Snapshot::new(
                 worktree.id,
                 worktree.root_name,
@@ -759,7 +769,7 @@ impl Worktree {
         !self.is_local()
     }
 
-    pub fn settings_location(&self, _: &ModelContext<Self>) -> SettingsLocation<'static> {
+    pub fn settings_location(&self, _: &Context<Self>) -> SettingsLocation<'static> {
         SettingsLocation {
             worktree_id: self.id(),
             path: Path::new(EMPTY_PATH),
@@ -817,17 +827,13 @@ impl Worktree {
         }
     }
 
-    pub fn root_file(&self, cx: &ModelContext<Self>) -> Option<Arc<File>> {
+    pub fn root_file(&self, cx: &Context<Self>) -> Option<Arc<File>> {
         let entry = self.root_entry()?;
-        Some(File::for_entry(entry.clone(), cx.handle()))
+        Some(File::for_entry(entry.clone(), cx.entity()))
     }
 
-    pub fn observe_updates<F, Fut>(
-        &mut self,
-        project_id: u64,
-        cx: &ModelContext<Worktree>,
-        callback: F,
-    ) where
+    pub fn observe_updates<F, Fut>(&mut self, project_id: u64, cx: &Context<Worktree>, callback: F)
+    where
         F: 'static + Send + Fn(proto::UpdateWorktree) -> Fut,
         Fut: 'static + Send + Future<Output = bool>,
     {
@@ -856,7 +862,7 @@ impl Worktree {
         }
     }
 
-    pub fn load_file(&self, path: &Path, cx: &ModelContext<Worktree>) -> Task<Result<LoadedFile>> {
+    pub fn load_file(&self, path: &Path, cx: &Context<Worktree>) -> Task<Result<LoadedFile>> {
         match self {
             Worktree::Local(this) => this.load_file(path, cx),
             Worktree::Remote(_) => {
@@ -865,7 +871,7 @@ impl Worktree {
         }
     }
 
-    pub fn load_staged_file(&self, path: &Path, cx: &AppContext) -> Task<Result<Option<String>>> {
+    pub fn load_staged_file(&self, path: &Path, cx: &App) -> Task<Result<Option<String>>> {
         match self {
             Worktree::Local(this) => {
                 let path = Arc::from(path);
@@ -892,7 +898,7 @@ impl Worktree {
     pub fn load_binary_file(
         &self,
         path: &Path,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<LoadedBinaryFile>> {
         match self {
             Worktree::Local(this) => this.load_binary_file(path, cx),
@@ -907,7 +913,7 @@ impl Worktree {
         path: &Path,
         text: Rope,
         line_ending: LineEnding,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
         match self {
             Worktree::Local(this) => this.write_file(path, text, line_ending, cx),
@@ -921,7 +927,7 @@ impl Worktree {
         &mut self,
         path: impl Into<Arc<Path>>,
         is_directory: bool,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
         let path = path.into();
         let worktree_id = self.id();
@@ -966,7 +972,7 @@ impl Worktree {
         &mut self,
         entry_id: ProjectEntryId,
         trash: bool,
-        cx: &mut ModelContext<Worktree>,
+        cx: &mut Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
         let task = match self {
             Worktree::Local(this) => this.delete_entry(entry_id, trash, cx),
@@ -1001,7 +1007,7 @@ impl Worktree {
         &mut self,
         entry_id: ProjectEntryId,
         new_path: impl Into<Arc<Path>>,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Result<CreatedEntry>> {
         let new_path = new_path.into();
         match self {
@@ -1015,7 +1021,7 @@ impl Worktree {
         entry_id: ProjectEntryId,
         relative_worktree_source_path: Option<PathBuf>,
         new_path: impl Into<Arc<Path>>,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Result<Option<Entry>>> {
         let new_path = new_path.into();
         match self {
@@ -1058,7 +1064,7 @@ impl Worktree {
         target_directory: PathBuf,
         paths: Vec<Arc<Path>>,
         overwrite_existing_files: bool,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Vec<ProjectEntryId>>> {
         match self {
             Worktree::Local(this) => {
@@ -1073,7 +1079,7 @@ impl Worktree {
     pub fn expand_entry(
         &mut self,
         entry_id: ProjectEntryId,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
         match self {
             Worktree::Local(this) => this.expand_entry(entry_id, cx),
@@ -1096,10 +1102,36 @@ impl Worktree {
         }
     }
 
+    pub fn expand_all_for_entry(
+        &mut self,
+        entry_id: ProjectEntryId,
+        cx: &Context<Worktree>,
+    ) -> Option<Task<Result<()>>> {
+        match self {
+            Worktree::Local(this) => this.expand_all_for_entry(entry_id, cx),
+            Worktree::Remote(this) => {
+                let response = this.client.request(proto::ExpandAllForProjectEntry {
+                    project_id: this.project_id,
+                    entry_id: entry_id.to_proto(),
+                });
+                Some(cx.spawn(move |this, mut cx| async move {
+                    let response = response.await?;
+                    this.update(&mut cx, |this, _| {
+                        this.as_remote_mut()
+                            .unwrap()
+                            .wait_for_snapshot(response.worktree_scan_id as usize)
+                    })?
+                    .await?;
+                    Ok(())
+                }))
+            }
+        }
+    }
+
     pub async fn handle_create_entry(
-        this: Model<Self>,
+        this: Entity<Self>,
         request: proto::CreateProjectEntry,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> Result<proto::ProjectEntryResponse> {
         let (scan_id, entry) = this.update(&mut cx, |this, cx| {
             (
@@ -1117,9 +1149,9 @@ impl Worktree {
     }
 
     pub async fn handle_delete_entry(
-        this: Model<Self>,
+        this: Entity<Self>,
         request: proto::DeleteProjectEntry,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> Result<proto::ProjectEntryResponse> {
         let (scan_id, task) = this.update(&mut cx, |this, cx| {
             (
@@ -1139,9 +1171,9 @@ impl Worktree {
     }
 
     pub async fn handle_expand_entry(
-        this: Model<Self>,
+        this: Entity<Self>,
         request: proto::ExpandProjectEntry,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> Result<proto::ExpandProjectEntryResponse> {
         let task = this.update(&mut cx, |this, cx| {
             this.expand_entry(ProjectEntryId::from_proto(request.entry_id), cx)
@@ -1153,10 +1185,25 @@ impl Worktree {
         })
     }
 
+    pub async fn handle_expand_all_for_entry(
+        this: Entity<Self>,
+        request: proto::ExpandAllForProjectEntry,
+        mut cx: AsyncApp,
+    ) -> Result<proto::ExpandAllForProjectEntryResponse> {
+        let task = this.update(&mut cx, |this, cx| {
+            this.expand_all_for_entry(ProjectEntryId::from_proto(request.entry_id), cx)
+        })?;
+        task.ok_or_else(|| anyhow!("no such entry"))?.await?;
+        let scan_id = this.read_with(&cx, |this, _| this.scan_id())?;
+        Ok(proto::ExpandAllForProjectEntryResponse {
+            worktree_scan_id: scan_id as u64,
+        })
+    }
+
     pub async fn handle_rename_entry(
-        this: Model<Self>,
+        this: Entity<Self>,
         request: proto::RenameProjectEntry,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> Result<proto::ProjectEntryResponse> {
         let (scan_id, task) = this.update(&mut cx, |this, cx| {
             (
@@ -1178,9 +1225,9 @@ impl Worktree {
     }
 
     pub async fn handle_copy_entry(
-        this: Model<Self>,
+        this: Entity<Self>,
         request: proto::CopyProjectEntry,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> Result<proto::ProjectEntryResponse> {
         let (scan_id, task) = this.update(&mut cx, |this, cx| {
             let relative_worktree_source_path =
@@ -1216,7 +1263,7 @@ impl LocalWorktree {
         !self.share_private_files && self.settings.is_path_private(path)
     }
 
-    fn restart_background_scanners(&mut self, cx: &ModelContext<Worktree>) {
+    fn restart_background_scanners(&mut self, cx: &Context<Worktree>) {
         let (scan_requests_tx, scan_requests_rx) = channel::unbounded();
         let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = channel::unbounded();
         self.scan_requests_tx = scan_requests_tx;
@@ -1237,8 +1284,8 @@ impl LocalWorktree {
     fn start_background_scanner(
         &mut self,
         scan_requests_rx: channel::Receiver<ScanRequest>,
-        path_prefixes_to_scan_rx: channel::Receiver<Arc<Path>>,
-        cx: &ModelContext<Worktree>,
+        path_prefixes_to_scan_rx: channel::Receiver<PathPrefixScanRequest>,
+        cx: &Context<Worktree>,
     ) {
         let snapshot = self.snapshot();
         let share_private_files = self.share_private_files;
@@ -1339,7 +1386,7 @@ impl LocalWorktree {
         &mut self,
         new_snapshot: LocalSnapshot,
         entry_changes: UpdatedEntriesSet,
-        cx: &mut ModelContext<Worktree>,
+        cx: &mut Context<Worktree>,
     ) {
         let repo_changes = self.changed_repos(&self.snapshot, &new_snapshot);
         self.snapshot = new_snapshot;
@@ -1495,7 +1542,7 @@ impl LocalWorktree {
     fn load_binary_file(
         &self,
         path: &Path,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<LoadedBinaryFile>> {
         let path = Arc::from(path);
         let abs_path = self.absolutize(&path);
@@ -1503,7 +1550,7 @@ impl LocalWorktree {
         let entry = self.refresh_entry(path.clone(), None, cx);
         let is_private = self.is_path_private(path.as_ref());
 
-        let worktree = cx.weak_model();
+        let worktree = cx.weak_entity();
         cx.background_executor().spawn(async move {
             let abs_path = abs_path?;
             let content = fs.load_bytes(&abs_path).await?;
@@ -1540,7 +1587,7 @@ impl LocalWorktree {
         })
     }
 
-    fn load_file(&self, path: &Path, cx: &ModelContext<Worktree>) -> Task<Result<LoadedFile>> {
+    fn load_file(&self, path: &Path, cx: &Context<Worktree>) -> Task<Result<LoadedFile>> {
         let path = Arc::from(path);
         let abs_path = self.absolutize(&path);
         let fs = self.fs.clone();
@@ -1600,7 +1647,7 @@ impl LocalWorktree {
         &self,
         path: impl Into<Arc<Path>>,
         is_dir: bool,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
         let path = path.into();
         let abs_path = match self.absolutize(&path) {
@@ -1665,7 +1712,7 @@ impl LocalWorktree {
         path: impl Into<Arc<Path>>,
         text: Rope,
         line_ending: LineEnding,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
         let path = path.into();
         let fs = self.fs.clone();
@@ -1720,7 +1767,7 @@ impl LocalWorktree {
         &self,
         entry_id: ProjectEntryId,
         trash: bool,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
         let entry = self.entry_for_id(entry_id)?.clone();
         let abs_path = self.absolutize(&entry.path);
@@ -1772,7 +1819,7 @@ impl LocalWorktree {
         &self,
         entry_id: ProjectEntryId,
         new_path: impl Into<Arc<Path>>,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
         let old_path = match self.entry_for_id(entry_id) {
             Some(entry) => entry.path.clone(),
@@ -1830,7 +1877,7 @@ impl LocalWorktree {
         entry_id: ProjectEntryId,
         relative_worktree_source_path: Option<PathBuf>,
         new_path: impl Into<Arc<Path>>,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Option<Entry>>> {
         let old_path = match self.entry_for_id(entry_id) {
             Some(entry) => entry.path.clone(),
@@ -1871,7 +1918,7 @@ impl LocalWorktree {
         target_directory: PathBuf,
         paths: Vec<Arc<Path>>,
         overwrite_existing_files: bool,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Vec<ProjectEntryId>>> {
         let worktree_path = self.abs_path().clone();
         let fs = self.fs.clone();
@@ -1918,7 +1965,7 @@ impl LocalWorktree {
                 })
                 .await
                 .log_err();
-            let mut refresh = cx.read_model(
+            let mut refresh = cx.read_entity(
                 &this.upgrade().with_context(|| "Dropped worktree")?,
                 |this, _| {
                     Ok::<postage::barrier::Receiver, anyhow::Error>(
@@ -1938,7 +1985,7 @@ impl LocalWorktree {
                 .log_err();
 
             let this = this.upgrade().with_context(|| "Dropped worktree")?;
-            cx.read_model(&this, |this, _| {
+            cx.read_entity(&this, |this, _| {
                 paths_to_refresh
                     .iter()
                     .filter_map(|path| Some(this.entry_for_path(path)?.id))
@@ -1950,12 +1997,25 @@ impl LocalWorktree {
     fn expand_entry(
         &self,
         entry_id: ProjectEntryId,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
         let path = self.entry_for_id(entry_id)?.path.clone();
         let mut refresh = self.refresh_entries_for_paths(vec![path]);
         Some(cx.background_executor().spawn(async move {
             refresh.next().await;
+            Ok(())
+        }))
+    }
+
+    fn expand_all_for_entry(
+        &self,
+        entry_id: ProjectEntryId,
+        cx: &Context<Worktree>,
+    ) -> Option<Task<Result<()>>> {
+        let path = self.entry_for_id(entry_id).unwrap().path.clone();
+        let mut rx = self.add_path_prefix_to_scan(path.clone());
+        Some(cx.background_executor().spawn(async move {
+            rx.next().await;
             Ok(())
         }))
     }
@@ -1971,15 +2031,22 @@ impl LocalWorktree {
         rx
     }
 
-    pub fn add_path_prefix_to_scan(&self, path_prefix: Arc<Path>) {
-        self.path_prefixes_to_scan_tx.try_send(path_prefix).ok();
+    pub fn add_path_prefix_to_scan(&self, path_prefix: Arc<Path>) -> barrier::Receiver {
+        let (tx, rx) = barrier::channel();
+        self.path_prefixes_to_scan_tx
+            .try_send(PathPrefixScanRequest {
+                path: path_prefix,
+                done: smallvec![tx],
+            })
+            .ok();
+        rx
     }
 
     fn refresh_entry(
         &self,
         path: Arc<Path>,
         old_path: Option<Arc<Path>>,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Option<Entry>>> {
         if self.settings.is_path_excluded(&path) {
             return Task::ready(Ok(None));
@@ -2003,7 +2070,7 @@ impl LocalWorktree {
         })
     }
 
-    fn observe_updates<F, Fut>(&mut self, project_id: u64, cx: &ModelContext<Worktree>, callback: F)
+    fn observe_updates<F, Fut>(&mut self, project_id: u64, cx: &Context<Worktree>, callback: F)
     where
         F: 'static + Send + Fn(proto::UpdateWorktree) -> Fut,
         Fut: Send + Future<Output = bool>,
@@ -2058,7 +2125,7 @@ impl LocalWorktree {
         });
     }
 
-    pub fn share_private_files(&mut self, cx: &ModelContext<Worktree>) {
+    pub fn share_private_files(&mut self, cx: &Context<Worktree>) {
         self.share_private_files = true;
         self.restart_background_scanners(cx);
     }
@@ -2087,7 +2154,7 @@ impl RemoteWorktree {
         }
     }
 
-    fn observe_updates<F, Fut>(&mut self, project_id: u64, cx: &ModelContext<Worktree>, callback: F)
+    fn observe_updates<F, Fut>(&mut self, project_id: u64, cx: &Context<Worktree>, callback: F)
     where
         F: 'static + Send + Fn(proto::UpdateWorktree) -> Fut,
         Fut: 'static + Send + Future<Output = bool>,
@@ -2153,7 +2220,7 @@ impl RemoteWorktree {
         &mut self,
         entry: proto::Entry,
         scan_id: usize,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<Entry>> {
         let wait_for_snapshot = self.wait_for_snapshot(scan_id);
         cx.spawn(|this, mut cx| async move {
@@ -2172,7 +2239,7 @@ impl RemoteWorktree {
         &self,
         entry_id: ProjectEntryId,
         trash: bool,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
         let response = self.client.request(proto::DeleteProjectEntry {
             project_id: self.project_id,
@@ -2201,7 +2268,7 @@ impl RemoteWorktree {
         &self,
         entry_id: ProjectEntryId,
         new_path: impl Into<Arc<Path>>,
-        cx: &ModelContext<Worktree>,
+        cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
         let new_path = new_path.into();
         let response = self.client.request(proto::RenameProjectEntry {
@@ -2361,13 +2428,13 @@ impl Snapshot {
         Some(removed_entry.path)
     }
 
-    pub fn status_for_file(&self, path: impl AsRef<Path>) -> Option<GitFileStatus> {
+    pub fn status_for_file(&self, path: impl AsRef<Path>) -> Option<FileStatus> {
         let path = path.as_ref();
         self.repository_for_path(path).and_then(|repo| {
             let repo_path = repo.relativize(path).unwrap();
             repo.statuses_by_path
                 .get(&PathKey(repo_path.0), &())
-                .map(|entry| entry.combined_status())
+                .map(|entry| entry.status)
         })
     }
 
@@ -2583,6 +2650,17 @@ impl Snapshot {
 
     pub fn repositories(&self) -> &SumTree<RepositoryEntry> {
         &self.repositories
+    }
+
+    pub fn repositories_with_abs_paths(
+        &self,
+    ) -> impl '_ + Iterator<Item = (&RepositoryEntry, PathBuf)> {
+        let base = self.abs_path();
+        self.repositories.iter().map(|repo| {
+            let path = repo.work_directory.location_in_repo.as_deref();
+            let path = path.unwrap_or(repo.work_directory.as_ref());
+            (repo, base.join(path))
+        })
     }
 
     /// Get the repository whose work directory corresponds to the given path.
@@ -3385,7 +3463,7 @@ impl fmt::Debug for Snapshot {
 
 #[derive(Clone, PartialEq)]
 pub struct File {
-    pub worktree: Model<Worktree>,
+    pub worktree: Entity<Worktree>,
     pub path: Arc<Path>,
     pub disk_state: DiskState,
     pub entry_id: Option<ProjectEntryId>,
@@ -3410,7 +3488,7 @@ impl language::File for File {
         &self.path
     }
 
-    fn full_path(&self, cx: &AppContext) -> PathBuf {
+    fn full_path(&self, cx: &App) -> PathBuf {
         let mut full_path = PathBuf::new();
         let worktree = self.worktree.read(cx);
 
@@ -3436,13 +3514,13 @@ impl language::File for File {
 
     /// Returns the last component of this handle's absolute path. If this handle refers to the root
     /// of its worktree, then this method will return the name of the worktree itself.
-    fn file_name<'a>(&'a self, cx: &'a AppContext) -> &'a OsStr {
+    fn file_name<'a>(&'a self, cx: &'a App) -> &'a OsStr {
         self.path
             .file_name()
             .unwrap_or_else(|| OsStr::new(&self.worktree.read(cx).root_name))
     }
 
-    fn worktree_id(&self, cx: &AppContext) -> WorktreeId {
+    fn worktree_id(&self, cx: &App) -> WorktreeId {
         self.worktree.read(cx).id()
     }
 
@@ -3450,7 +3528,7 @@ impl language::File for File {
         self
     }
 
-    fn to_proto(&self, cx: &AppContext) -> rpc::proto::File {
+    fn to_proto(&self, cx: &App) -> rpc::proto::File {
         rpc::proto::File {
             worktree_id: self.worktree.read(cx).id().to_proto(),
             entry_id: self.entry_id.map(|id| id.to_proto()),
@@ -3466,7 +3544,7 @@ impl language::File for File {
 }
 
 impl language::LocalFile for File {
-    fn abs_path(&self, cx: &AppContext) -> PathBuf {
+    fn abs_path(&self, cx: &App) -> PathBuf {
         let worktree_path = &self.worktree.read(cx).as_local().unwrap().abs_path;
         if self.path.as_ref() == Path::new("") {
             worktree_path.as_path().to_path_buf()
@@ -3475,7 +3553,7 @@ impl language::LocalFile for File {
         }
     }
 
-    fn load(&self, cx: &AppContext) -> Task<Result<String>> {
+    fn load(&self, cx: &App) -> Task<Result<String>> {
         let worktree = self.worktree.read(cx).as_local().unwrap();
         let abs_path = worktree.absolutize(&self.path);
         let fs = worktree.fs.clone();
@@ -3483,7 +3561,7 @@ impl language::LocalFile for File {
             .spawn(async move { fs.load(&abs_path?).await })
     }
 
-    fn load_bytes(&self, cx: &AppContext) -> Task<Result<Vec<u8>>> {
+    fn load_bytes(&self, cx: &App) -> Task<Result<Vec<u8>>> {
         let worktree = self.worktree.read(cx).as_local().unwrap();
         let abs_path = worktree.absolutize(&self.path);
         let fs = worktree.fs.clone();
@@ -3493,7 +3571,7 @@ impl language::LocalFile for File {
 }
 
 impl File {
-    pub fn for_entry(entry: Entry, worktree: Model<Worktree>) -> Arc<Self> {
+    pub fn for_entry(entry: Entry, worktree: Entity<Worktree>) -> Arc<Self> {
         Arc::new(Self {
             worktree,
             path: entry.path.clone(),
@@ -3510,8 +3588,8 @@ impl File {
 
     pub fn from_proto(
         proto: rpc::proto::File,
-        worktree: Model<Worktree>,
-        cx: &AppContext,
+        worktree: Entity<Worktree>,
+        cx: &App,
     ) -> Result<Self> {
         let worktree_id = worktree
             .read(cx)
@@ -3547,11 +3625,11 @@ impl File {
         file.and_then(|f| f.as_any().downcast_ref())
     }
 
-    pub fn worktree_id(&self, cx: &AppContext) -> WorktreeId {
+    pub fn worktree_id(&self, cx: &App) -> WorktreeId {
         self.worktree.read(cx).id()
     }
 
-    pub fn project_entry_id(&self, _: &AppContext) -> Option<ProjectEntryId> {
+    pub fn project_entry_id(&self, _: &App) -> Option<ProjectEntryId> {
         match self.disk_state {
             DiskState::Deleted => None,
             _ => self.entry_id,
@@ -3633,41 +3711,41 @@ pub type UpdatedGitRepositoriesSet = Arc<[(Arc<Path>, GitRepositoryChange)]>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusEntry {
     pub repo_path: RepoPath,
-    pub status: GitStatusPair,
+    pub status: FileStatus,
 }
 
 impl StatusEntry {
-    // TODO revisit uses of this
-    pub fn combined_status(&self) -> GitFileStatus {
-        self.status.combined()
-    }
-
-    pub fn index_status(&self) -> Option<GitFileStatus> {
-        self.status.index_status
-    }
-
-    pub fn worktree_status(&self) -> Option<GitFileStatus> {
-        self.status.worktree_status
-    }
-
     pub fn is_staged(&self) -> Option<bool> {
         self.status.is_staged()
     }
 
     fn to_proto(&self) -> proto::StatusEntry {
+        let simple_status = match self.status {
+            FileStatus::Ignored | FileStatus::Untracked => proto::GitStatus::Added as i32,
+            FileStatus::Unmerged { .. } => proto::GitStatus::Conflict as i32,
+            FileStatus::Tracked(TrackedStatus {
+                index_status,
+                worktree_status,
+            }) => tracked_status_to_proto(if worktree_status != StatusCode::Unmodified {
+                worktree_status
+            } else {
+                index_status
+            }),
+        };
         proto::StatusEntry {
             repo_path: self.repo_path.to_proto(),
-            status: status_pair_to_proto(self.status.clone()),
+            simple_status,
+            status: Some(status_to_proto(self.status)),
         }
     }
 }
 
 impl TryFrom<proto::StatusEntry> for StatusEntry {
     type Error = anyhow::Error;
+
     fn try_from(value: proto::StatusEntry) -> Result<Self, Self::Error> {
         let repo_path = RepoPath(Path::new(&value.repo_path).into());
-        let status = status_pair_from_proto(value.status)
-            .ok_or_else(|| anyhow!("Unable to parse status value {}", value.status))?;
+        let status = status_from_proto(value.simple_status, value.status)?;
         Ok(Self { repo_path, status })
     }
 }
@@ -3734,43 +3812,13 @@ impl sum_tree::KeyedItem for RepositoryEntry {
     }
 }
 
-impl sum_tree::Summary for GitStatuses {
-    type Context = ();
-
-    fn zero(_: &Self::Context) -> Self {
-        Default::default()
-    }
-
-    fn add_summary(&mut self, rhs: &Self, _: &Self::Context) {
-        *self += *rhs;
-    }
-}
-
 impl sum_tree::Item for StatusEntry {
-    type Summary = PathSummary<GitStatuses>;
+    type Summary = PathSummary<GitSummary>;
 
     fn summary(&self, _: &<Self::Summary as Summary>::Context) -> Self::Summary {
         PathSummary {
             max_path: self.repo_path.0.clone(),
-            item_summary: match self.combined_status() {
-                GitFileStatus::Added => GitStatuses {
-                    added: 1,
-                    ..Default::default()
-                },
-                GitFileStatus::Modified => GitStatuses {
-                    modified: 1,
-                    ..Default::default()
-                },
-                GitFileStatus::Conflict => GitStatuses {
-                    conflict: 1,
-                    ..Default::default()
-                },
-                GitFileStatus::Deleted => Default::default(),
-                GitFileStatus::Untracked => GitStatuses {
-                    untracked: 1,
-                    ..Default::default()
-                },
-            },
+            item_summary: self.status.summary(),
         }
     }
 }
@@ -3783,69 +3831,12 @@ impl sum_tree::KeyedItem for StatusEntry {
     }
 }
 
-#[derive(Clone, Debug, Default, Copy, PartialEq, Eq)]
-pub struct GitStatuses {
-    added: usize,
-    modified: usize,
-    conflict: usize,
-    untracked: usize,
-}
-
-impl GitStatuses {
-    pub fn to_status(&self) -> Option<GitFileStatus> {
-        if self.conflict > 0 {
-            Some(GitFileStatus::Conflict)
-        } else if self.modified > 0 {
-            Some(GitFileStatus::Modified)
-        } else if self.added > 0 || self.untracked > 0 {
-            Some(GitFileStatus::Added)
-        } else {
-            None
-        }
-    }
-}
-
-impl std::ops::Add<Self> for GitStatuses {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self {
-        GitStatuses {
-            added: self.added + rhs.added,
-            modified: self.modified + rhs.modified,
-            conflict: self.conflict + rhs.conflict,
-            untracked: self.untracked + rhs.untracked,
-        }
-    }
-}
-
-impl std::ops::AddAssign for GitStatuses {
-    fn add_assign(&mut self, rhs: Self) {
-        self.added += rhs.added;
-        self.modified += rhs.modified;
-        self.conflict += rhs.conflict;
-        self.untracked += rhs.untracked;
-    }
-}
-
-impl std::ops::Sub for GitStatuses {
-    type Output = GitStatuses;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        GitStatuses {
-            added: self.added - rhs.added,
-            modified: self.modified - rhs.modified,
-            conflict: self.conflict - rhs.conflict,
-            untracked: self.untracked - rhs.untracked,
-        }
-    }
-}
-
-impl<'a> sum_tree::Dimension<'a, PathSummary<GitStatuses>> for GitStatuses {
+impl<'a> sum_tree::Dimension<'a, PathSummary<GitSummary>> for GitSummary {
     fn zero(_cx: &()) -> Self {
         Default::default()
     }
 
-    fn add_summary(&mut self, summary: &'a PathSummary<GitStatuses>, _: &()) {
+    fn add_summary(&mut self, summary: &'a PathSummary<GitSummary>, _: &()) {
         *self += summary.item_summary
     }
 }
@@ -4082,7 +4073,7 @@ struct BackgroundScanner {
     status_updates_tx: UnboundedSender<ScanState>,
     executor: BackgroundExecutor,
     scan_requests_rx: channel::Receiver<ScanRequest>,
-    path_prefixes_to_scan_rx: channel::Receiver<Arc<Path>>,
+    path_prefixes_to_scan_rx: channel::Receiver<PathPrefixScanRequest>,
     next_entry_id: Arc<AtomicUsize>,
     phase: BackgroundScannerPhase,
     watcher: Arc<dyn Watcher>,
@@ -4207,23 +4198,24 @@ impl BackgroundScanner {
                     }
                 }
 
-                path_prefix = self.path_prefixes_to_scan_rx.recv().fuse() => {
-                    let Ok(path_prefix) = path_prefix else { break };
-                    log::trace!("adding path prefix {:?}", path_prefix);
+                path_prefix_request = self.path_prefixes_to_scan_rx.recv().fuse() => {
+                    let Ok(request) = path_prefix_request else { break };
+                    log::trace!("adding path prefix {:?}", request.path);
 
-                    let did_scan = self.forcibly_load_paths(&[path_prefix.clone()]).await;
+                    let did_scan = self.forcibly_load_paths(&[request.path.clone()]).await;
                     if did_scan {
                         let abs_path =
                         {
                             let mut state = self.state.lock();
-                            state.path_prefixes_to_scan.insert(path_prefix.clone());
-                            state.snapshot.abs_path.as_path().join(&path_prefix)
+                            state.path_prefixes_to_scan.insert(request.path.clone());
+                            state.snapshot.abs_path.as_path().join(&request.path)
                         };
 
                         if let Some(abs_path) = self.fs.canonicalize(&abs_path).await.log_err() {
                             self.process_events(vec![abs_path]).await;
                         }
                     }
+                    self.send_status_update(false, request.done);
                 }
 
                 paths = fs_events_rx.next().fuse() => {
@@ -4245,7 +4237,7 @@ impl BackgroundScanner {
 
         let root_path = self.state.lock().snapshot.abs_path.clone();
         let root_canonical_path = match self.fs.canonicalize(root_path.as_path()).await {
-            Ok(path) => path,
+            Ok(path) => SanitizedPath::from(path),
             Err(err) => {
                 log::error!("failed to canonicalize root path: {}", err);
                 return true;
@@ -4256,9 +4248,9 @@ impl BackgroundScanner {
             .iter()
             .map(|path| {
                 if path.file_name().is_some() {
-                    root_canonical_path.join(path)
+                    root_canonical_path.as_path().join(path).to_path_buf()
                 } else {
-                    root_canonical_path.clone()
+                    root_canonical_path.as_path().to_path_buf()
                 }
             })
             .collect::<Vec<_>>();
@@ -4273,7 +4265,7 @@ impl BackgroundScanner {
         }
 
         self.reload_entries_for_paths(
-            root_path.into(),
+            root_path,
             root_canonical_path,
             &request.relative_paths,
             abs_paths,
@@ -4287,7 +4279,7 @@ impl BackgroundScanner {
     async fn process_events(&self, mut abs_paths: Vec<PathBuf>) {
         let root_path = self.state.lock().snapshot.abs_path.clone();
         let root_canonical_path = match self.fs.canonicalize(root_path.as_path()).await {
-            Ok(path) => path,
+            Ok(path) => SanitizedPath::from(path),
             Err(err) => {
                 let new_path = self
                     .state
@@ -4320,6 +4312,7 @@ impl BackgroundScanner {
         abs_paths.sort_unstable();
         abs_paths.dedup_by(|a, b| a.starts_with(b));
         abs_paths.retain(|abs_path| {
+            let abs_path = SanitizedPath::from(abs_path);
             let snapshot = &self.state.lock().snapshot;
             {
                 let mut is_git_related = false;
@@ -4331,7 +4324,7 @@ impl BackgroundScanner {
                     FsMonitor
                 }
                 let mut fsmonitor_parse_state = None;
-                if let Some(dot_git_abs_path) = abs_path
+                if let Some(dot_git_abs_path) = abs_path.as_path()
                     .ancestors()
                     .find(|ancestor| {
                         let file_name = ancestor.file_name();
@@ -4404,7 +4397,7 @@ impl BackgroundScanner {
         let (scan_job_tx, scan_job_rx) = channel::unbounded();
         log::debug!("received fs events {:?}", relative_paths);
         self.reload_entries_for_paths(
-            root_path.into(),
+            root_path,
             root_canonical_path,
             &relative_paths,
             abs_paths,
@@ -4763,8 +4756,8 @@ impl BackgroundScanner {
     /// All list arguments should be sorted before calling this function
     async fn reload_entries_for_paths(
         &self,
-        root_abs_path: Arc<Path>,
-        root_canonical_path: PathBuf,
+        root_abs_path: SanitizedPath,
+        root_canonical_path: SanitizedPath,
         relative_paths: &[Arc<Path>],
         abs_paths: Vec<PathBuf>,
         scan_queue_tx: Option<Sender<ScanJob>>,
@@ -4792,7 +4785,7 @@ impl BackgroundScanner {
                             }
                         }
 
-                        anyhow::Ok(Some((metadata, canonical_path)))
+                        anyhow::Ok(Some((metadata, SanitizedPath::from(canonical_path))))
                     } else {
                         Ok(None)
                     }
@@ -4851,7 +4844,7 @@ impl BackgroundScanner {
 
                     changed_path_statuses.push(Edit::Insert(StatusEntry {
                         repo_path: repo_path.clone(),
-                        status: status.clone(),
+                        status: *status,
                     }));
                 }
 
@@ -4889,7 +4882,7 @@ impl BackgroundScanner {
         }
 
         for (path, metadata) in relative_paths.iter().zip(metadata.into_iter()) {
-            let abs_path: Arc<Path> = root_abs_path.join(path).into();
+            let abs_path: Arc<Path> = root_abs_path.as_path().join(path).into();
             match metadata {
                 Ok(Some((metadata, canonical_path))) => {
                     let ignore_stack = state
@@ -4902,7 +4895,7 @@ impl BackgroundScanner {
                         self.next_entry_id.as_ref(),
                         state.snapshot.root_char_bag,
                         if metadata.is_symlink {
-                            Some(canonical_path.into())
+                            Some(canonical_path.as_path().to_path_buf().into())
                         } else {
                             None
                         },
@@ -5280,7 +5273,7 @@ impl BackgroundScanner {
             new_entries_by_path.insert_or_replace(
                 StatusEntry {
                     repo_path: repo_path.clone(),
-                    status: status.clone(),
+                    status: *status,
                 },
                 &(),
             );
@@ -5536,7 +5529,7 @@ pub trait WorktreeModelHandle {
     ) -> futures::future::LocalBoxFuture<'a, ()>;
 }
 
-impl WorktreeModelHandle for Model<Worktree> {
+impl WorktreeModelHandle for Entity<Worktree> {
     // When the worktree's FS event stream sometimes delivers "redundant" events for FS changes that
     // occurred before the worktree was constructed. These events can cause the worktree to perform
     // extra directory scans, and emit extra scan-state notifications.
@@ -5695,14 +5688,14 @@ impl<'a> Default for TraversalProgress<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct GitEntryRef<'a> {
     pub entry: &'a Entry,
-    pub git_status: Option<GitFileStatus>,
+    pub git_summary: GitSummary,
 }
 
 impl<'a> GitEntryRef<'a> {
     pub fn to_owned(&self) -> GitEntry {
         GitEntry {
             entry: self.entry.clone(),
-            git_status: self.git_status,
+            git_summary: self.git_summary,
         }
     }
 }
@@ -5724,14 +5717,14 @@ impl<'a> AsRef<Entry> for GitEntryRef<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitEntry {
     pub entry: Entry,
-    pub git_status: Option<GitFileStatus>,
+    pub git_summary: GitSummary,
 }
 
 impl GitEntry {
     pub fn to_ref(&self) -> GitEntryRef {
         GitEntryRef {
             entry: &self.entry,
-            git_status: self.git_status,
+            git_summary: self.git_summary,
         }
     }
 }
@@ -5753,7 +5746,7 @@ impl AsRef<Entry> for GitEntry {
 /// Walks the worktree entries and their associated git statuses.
 pub struct GitTraversal<'a> {
     traversal: Traversal<'a>,
-    current_entry_status: Option<GitFileStatus>,
+    current_entry_summary: Option<GitSummary>,
     repo_location: Option<(
         &'a RepositoryEntry,
         Cursor<'a, StatusEntry, PathProgress<'a>>,
@@ -5762,7 +5755,7 @@ pub struct GitTraversal<'a> {
 
 impl<'a> GitTraversal<'a> {
     fn synchronize_statuses(&mut self, reset: bool) {
-        self.current_entry_status = None;
+        self.current_entry_summary = None;
 
         let Some(entry) = self.traversal.cursor.item() else {
             return;
@@ -5787,14 +5780,17 @@ impl<'a> GitTraversal<'a> {
         if entry.is_dir() {
             let mut statuses = statuses.clone();
             statuses.seek_forward(&PathTarget::Path(repo_path.as_ref()), Bias::Left, &());
-            let summary: GitStatuses =
+            let summary =
                 statuses.summary(&PathTarget::Successor(repo_path.as_ref()), Bias::Left, &());
 
-            self.current_entry_status = summary.to_status();
+            self.current_entry_summary = Some(summary);
         } else if entry.is_file() {
             // For a file entry, park the cursor on the corresponding status
             if statuses.seek_forward(&PathTarget::Path(repo_path.as_ref()), Bias::Left, &()) {
-                self.current_entry_status = Some(statuses.item().unwrap().combined_status());
+                // TODO: Investigate statuses.item() being None here.
+                self.current_entry_summary = statuses.item().map(|item| item.status.into());
+            } else {
+                self.current_entry_summary = Some(GitSummary::UNCHANGED);
             }
         }
     }
@@ -5830,10 +5826,9 @@ impl<'a> GitTraversal<'a> {
     }
 
     pub fn entry(&self) -> Option<GitEntryRef<'a>> {
-        Some(GitEntryRef {
-            entry: self.traversal.cursor.item()?,
-            git_status: self.current_entry_status,
-        })
+        let entry = self.traversal.cursor.item()?;
+        let git_summary = self.current_entry_summary.unwrap_or(GitSummary::UNCHANGED);
+        Some(GitEntryRef { entry, git_summary })
     }
 }
 
@@ -5884,7 +5879,7 @@ impl<'a> Traversal<'a> {
     pub fn with_git_statuses(self) -> GitTraversal<'a> {
         let mut this = GitTraversal {
             traversal: self,
-            current_entry_status: None,
+            current_entry_summary: None,
             repo_location: None,
         };
         this.synchronize_statuses(true);
@@ -6003,10 +5998,10 @@ impl<'a, 'b, S: Summary> SeekTarget<'a, PathSummary<S>, TraversalProgress<'a>> f
     }
 }
 
-impl<'a, 'b> SeekTarget<'a, PathSummary<GitStatuses>, (TraversalProgress<'a>, GitStatuses)>
+impl<'a, 'b> SeekTarget<'a, PathSummary<GitSummary>, (TraversalProgress<'a>, GitSummary)>
     for PathTarget<'b>
 {
-    fn cmp(&self, cursor_location: &(TraversalProgress<'a>, GitStatuses), _: &()) -> Ordering {
+    fn cmp(&self, cursor_location: &(TraversalProgress<'a>, GitSummary), _: &()) -> Ordering {
         self.cmp_path(&cursor_location.0.max_path)
     }
 }
@@ -6159,28 +6154,135 @@ impl<'a> TryFrom<(&'a CharBag, &PathMatcher, proto::Entry)> for Entry {
     }
 }
 
-// TODO pass the status pair all the way through
-fn status_pair_from_proto(proto: i32) -> Option<GitStatusPair> {
-    let proto = proto::GitStatus::from_i32(proto)?;
-    let worktree_status = match proto {
-        proto::GitStatus::Added => GitFileStatus::Added,
-        proto::GitStatus::Modified => GitFileStatus::Modified,
-        proto::GitStatus::Conflict => GitFileStatus::Conflict,
-        proto::GitStatus::Deleted => GitFileStatus::Deleted,
+fn status_from_proto(
+    simple_status: i32,
+    status: Option<proto::GitFileStatus>,
+) -> anyhow::Result<FileStatus> {
+    use proto::git_file_status::Variant;
+
+    let Some(variant) = status.and_then(|status| status.variant) else {
+        let code = proto::GitStatus::from_i32(simple_status)
+            .ok_or_else(|| anyhow!("Invalid git status code: {simple_status}"))?;
+        let result = match code {
+            proto::GitStatus::Added => TrackedStatus {
+                worktree_status: StatusCode::Added,
+                index_status: StatusCode::Unmodified,
+            }
+            .into(),
+            proto::GitStatus::Modified => TrackedStatus {
+                worktree_status: StatusCode::Modified,
+                index_status: StatusCode::Unmodified,
+            }
+            .into(),
+            proto::GitStatus::Conflict => UnmergedStatus {
+                first_head: UnmergedStatusCode::Updated,
+                second_head: UnmergedStatusCode::Updated,
+            }
+            .into(),
+            proto::GitStatus::Deleted => TrackedStatus {
+                worktree_status: StatusCode::Deleted,
+                index_status: StatusCode::Unmodified,
+            }
+            .into(),
+            _ => return Err(anyhow!("Invalid code for simple status: {simple_status}")),
+        };
+        return Ok(result);
     };
-    Some(GitStatusPair {
-        index_status: None,
-        worktree_status: Some(worktree_status),
-    })
+
+    let result = match variant {
+        Variant::Untracked(_) => FileStatus::Untracked,
+        Variant::Ignored(_) => FileStatus::Ignored,
+        Variant::Unmerged(unmerged) => {
+            let [first_head, second_head] =
+                [unmerged.first_head, unmerged.second_head].map(|head| {
+                    let code = proto::GitStatus::from_i32(head)
+                        .ok_or_else(|| anyhow!("Invalid git status code: {head}"))?;
+                    let result = match code {
+                        proto::GitStatus::Added => UnmergedStatusCode::Added,
+                        proto::GitStatus::Updated => UnmergedStatusCode::Updated,
+                        proto::GitStatus::Deleted => UnmergedStatusCode::Deleted,
+                        _ => return Err(anyhow!("Invalid code for unmerged status: {code:?}")),
+                    };
+                    Ok(result)
+                });
+            let [first_head, second_head] = [first_head?, second_head?];
+            UnmergedStatus {
+                first_head,
+                second_head,
+            }
+            .into()
+        }
+        Variant::Tracked(tracked) => {
+            let [index_status, worktree_status] = [tracked.index_status, tracked.worktree_status]
+                .map(|status| {
+                    let code = proto::GitStatus::from_i32(status)
+                        .ok_or_else(|| anyhow!("Invalid git status code: {status}"))?;
+                    let result = match code {
+                        proto::GitStatus::Modified => StatusCode::Modified,
+                        proto::GitStatus::TypeChanged => StatusCode::TypeChanged,
+                        proto::GitStatus::Added => StatusCode::Added,
+                        proto::GitStatus::Deleted => StatusCode::Deleted,
+                        proto::GitStatus::Renamed => StatusCode::Renamed,
+                        proto::GitStatus::Copied => StatusCode::Copied,
+                        proto::GitStatus::Unmodified => StatusCode::Unmodified,
+                        _ => return Err(anyhow!("Invalid code for tracked status: {code:?}")),
+                    };
+                    Ok(result)
+                });
+            let [index_status, worktree_status] = [index_status?, worktree_status?];
+            TrackedStatus {
+                index_status,
+                worktree_status,
+            }
+            .into()
+        }
+    };
+    Ok(result)
 }
 
-fn status_pair_to_proto(status: GitStatusPair) -> i32 {
-    match status.combined() {
-        GitFileStatus::Added => proto::GitStatus::Added as i32,
-        GitFileStatus::Modified => proto::GitStatus::Modified as i32,
-        GitFileStatus::Conflict => proto::GitStatus::Conflict as i32,
-        GitFileStatus::Deleted => proto::GitStatus::Deleted as i32,
-        GitFileStatus::Untracked => proto::GitStatus::Added as i32, // TODO
+fn status_to_proto(status: FileStatus) -> proto::GitFileStatus {
+    use proto::git_file_status::{Tracked, Unmerged, Variant};
+
+    let variant = match status {
+        FileStatus::Untracked => Variant::Untracked(Default::default()),
+        FileStatus::Ignored => Variant::Ignored(Default::default()),
+        FileStatus::Unmerged(UnmergedStatus {
+            first_head,
+            second_head,
+        }) => Variant::Unmerged(Unmerged {
+            first_head: unmerged_status_to_proto(first_head),
+            second_head: unmerged_status_to_proto(second_head),
+        }),
+        FileStatus::Tracked(TrackedStatus {
+            index_status,
+            worktree_status,
+        }) => Variant::Tracked(Tracked {
+            index_status: tracked_status_to_proto(index_status),
+            worktree_status: tracked_status_to_proto(worktree_status),
+        }),
+    };
+    proto::GitFileStatus {
+        variant: Some(variant),
+    }
+}
+
+fn unmerged_status_to_proto(code: UnmergedStatusCode) -> i32 {
+    match code {
+        UnmergedStatusCode::Added => proto::GitStatus::Added as _,
+        UnmergedStatusCode::Deleted => proto::GitStatus::Deleted as _,
+        UnmergedStatusCode::Updated => proto::GitStatus::Updated as _,
+    }
+}
+
+fn tracked_status_to_proto(code: StatusCode) -> i32 {
+    match code {
+        StatusCode::Added => proto::GitStatus::Added as _,
+        StatusCode::Deleted => proto::GitStatus::Deleted as _,
+        StatusCode::Modified => proto::GitStatus::Modified as _,
+        StatusCode::Renamed => proto::GitStatus::Renamed as _,
+        StatusCode::TypeChanged => proto::GitStatus::TypeChanged as _,
+        StatusCode::Copied => proto::GitStatus::Copied as _,
+        StatusCode::Unmodified => proto::GitStatus::Unmodified as _,
     }
 }
 

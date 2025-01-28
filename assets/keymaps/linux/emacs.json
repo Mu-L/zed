@@ -15,6 +15,9 @@
       "ctrl-x b": "tab_switcher::Toggle", // switch-to-buffer
       "alt-g g": "go_to_line::Toggle", // goto-line
       "alt-g alt-g": "go_to_line::Toggle", // goto-line
+      "ctrl-space": "editor::SetMark", // set-mark
+      "ctrl-@": "editor::SetMark", // set-mark
+      "ctrl-x ctrl-x": "editor::SwapSelectionEnds", // exchange-point-and-mark
       "ctrl-f": "editor::MoveRight", // forward-char
       "ctrl-b": "editor::MoveLeft", // backward-char
       "ctrl-n": "editor::MoveDown", // next-line
@@ -23,6 +26,8 @@
       "end": ["editor::MoveToEndOfLine", { "stop_at_soft_wraps": false }], // move-end-of-line
       "ctrl-a": ["editor::MoveToBeginningOfLine", { "stop_at_soft_wraps": false }], // move-beginning-of-line
       "ctrl-e": ["editor::MoveToEndOfLine", { "stop_at_soft_wraps": false }], // move-end-of-line
+      "shift-home": ["editor::SelectToBeginningOfLine", { "stop_at_soft_wraps": false }], // move-beginning-of-line
+      "shift-end": ["editor::SelectToEndOfLine", { "stop_at_soft_wraps": false }], // move-end-of-line
       "alt-f": "editor::MoveToNextSubwordEnd", // forward-word
       "alt-b": "editor::MoveToPreviousSubwordStart", // backward-word
       "alt-u": "editor::ConvertToUpperCase", // upcase-word
@@ -51,20 +56,16 @@
       "alt->": "editor::MoveToEnd", // end-of-buffer
       "ctrl-l": "editor::ScrollCursorCenterTopBottom", // recenter-top-bottom
       "ctrl-s": "buffer_search::Deploy", // isearch-forward
-      "alt-^": "editor::JoinLines", // join-line
-      "alt-/": "editor::ShowCompletions" // dabbrev-expand
+      "alt-^": "editor::JoinLines" // join-line
     }
   },
-  // Extend selection with movement bindings
   {
-    "context": "Editor && (mode == full) && selection",
+    "context": "Editor && selection_mode", // region selection
     "bindings": {
       "right": "editor::SelectRight",
       "left": "editor::SelectLeft",
       "down": "editor::SelectDown",
       "up": "editor::SelectUp",
-      "home": "editor::SelectToBeginningOfLine",
-      "end": "editor::SelectToEndOfLine",
       "alt-left": "editor::SelectToPreviousWordStart",
       "alt-right": "editor::SelectToNextWordEnd",
       "pagedown": "editor::SelectPageDown",
@@ -73,43 +74,15 @@
       "ctrl-b": "editor::SelectLeft",
       "ctrl-n": "editor::SelectDown",
       "ctrl-p": "editor::SelectUp",
-      "ctrl-a": "editor::SelectToBeginningOfLine",
-      "ctrl-e": "editor::SelectToEndOfLine",
+      "home": ["editor::SelectToBeginningOfLine", { "stop_at_soft_wraps": false }],
+      "end": ["editor::SelectToEndOfLine", { "stop_at_soft_wraps": false }],
+      "ctrl-a": ["editor::SelectToBeginningOfLine", { "stop_at_soft_wraps": false }],
+      "ctrl-e": ["editor::SelectToEndOfLine", { "stop_at_soft_wraps": false }],
       "alt-f": "editor::SelectToNextWordEnd",
       "alt-b": "editor::SelectToPreviousSubwordStart",
       "alt-<": "editor::SelectToBeginning",
       "alt->": "editor::SelectToEnd",
-      "ctrl-space": "editor::Cancel" // clear mark
-    }
-  },
-  // Emacs set-mark-command emulation (ctrl-space + movement bindings)
-  {
-    "context": "Editor && (mode == full) && !selection",
-    "bindings": {
-      "ctrl-space right": "editor::SelectRight",
-      "ctrl-space left": "editor::SelectLeft",
-      "ctrl-space down": "editor::SelectDown",
-      "ctrl-space up": "editor::SelectUp",
-      "ctrl-space home": "editor::SelectToBeginningOfLine",
-      "ctrl-space end": "editor::SelectToEndOfLine",
-      "ctrl-space alt-left": "editor::SelectToPreviousWordStart",
-      "ctrl-space alt-right": "editor::SelectToNextWordEnd",
-      "ctrl-space pagedown": "editor::SelectPageDown",
-      "ctrl-space pageup": "editor::SelectPageUp",
-      "ctrl-space ctrl-f": "editor::SelectRight",
-      "ctrl-space ctrl-b": "editor::SelectLeft",
-      "ctrl-space ctrl-n": "editor::SelectDown",
-      "ctrl-space ctrl-p": "editor::SelectUp",
-      "ctrl-space ctrl-a": "editor::SelectToBeginningOfLine",
-      "ctrl-space ctrl-e": "editor::SelectToEndOfLine",
-      "ctrl-space alt-f": "editor::SelectToNextWordEnd",
-      "ctrl-space alt-b": "editor::SelectToPreviousWordStart",
-      "ctrl-space alt-<": "editor::SelectToBeginning",
-      "ctrl-space alt->": "editor::SelectToEnd",
-      "ctrl-space alt-v": "editor::SelectPageUp",
-      "ctrl-space ctrl-v": "editor::SelectPageDown",
-      "ctrl-space alt-{": "editor::SelectToStartOfParagraph",
-      "ctrl-space alt-}": "editor::SelectToEndOfParagraph"
+      "ctrl-g": "editor::Cancel"
     }
   },
   {
