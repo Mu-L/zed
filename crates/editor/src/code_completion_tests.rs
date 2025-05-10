@@ -90,12 +90,12 @@ fn test_sort_matches_local_variable_over_global_variable(_cx: &mut TestAppContex
     );
     assert_eq!(
         matches[2].string_match.string.as_str(),
-        "floorf128",
+        "floorf16",
         "Match order not expected"
     );
     assert_eq!(
         matches[3].string_match.string.as_str(),
-        "floorf16",
+        "floorf32",
         "Match order not expected"
     );
 
@@ -433,7 +433,51 @@ fn test_sort_matches_for_unreachable(_cx: &mut TestAppContext) {
         "Match order not expected"
     );
 
-    // Case 4: "unreachable"
+    // Case 4: "unreachabl"
+    let query: Option<&str> = Some("unreachable");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.9090909090909092,
+                positions: vec![],
+                string: "unreachable".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000000"),
+            sort_key: (3, "unreachable"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.6666666666666666,
+                positions: vec![],
+                string: "unreachable!(…)".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "unreachable!(…)"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.47619047619047616,
+                positions: vec![],
+                string: "unreachable_unchecked".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000000"),
+            sort_key: (3, "unreachable_unchecked"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::default());
+    assert_eq!(
+        matches[0].string_match.string.as_str(),
+        "unreachable!(…)",
+        "Match order not expected"
+    );
+
+    // Case 5: "unreachable"
     let query: Option<&str> = Some("unreachable");
     let mut matches: Vec<SortableMatch<'_>> = vec![
         SortableMatch {
@@ -473,8 +517,8 @@ fn test_sort_matches_for_unreachable(_cx: &mut TestAppContext) {
     CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::default());
     assert_eq!(
         matches[0].string_match.string.as_str(),
-        "unreachable!(…)",
-        "Match order not expected"
+        "unreachable",
+        "Perfect fuzzy match should be preferred over others"
     );
 }
 
@@ -956,17 +1000,17 @@ fn test_sort_matches_jsx_event_handler(_cx: &mut TestAppContext) {
             .collect::<Vec<&str>>(),
         vec![
             "onAbort?",
+            "onAuxClick?",
             "onAbortCapture?",
             "onAnimationEnd?",
-            "onAnimationEndCapture?",
-            "onAnimationIteration?",
             "onAnimationStart?",
-            "onAuxClick?",
             "onAuxClickCapture?",
-            "onCanPlay?",
-            "onChange?",
+            "onAnimationIteration?",
+            "onAnimationEndCapture?",
             "onDrag?",
-            "onDragEnd?",
+            "onLoad?",
+            "onPlay?",
+            "onPaste?",
         ]
     );
 }
@@ -985,7 +1029,7 @@ fn test_sort_matches_for_snippets(_cx: &mut TestAppContext) {
             },
             is_snippet: false,
             sort_text: Some("80000000"),
-            sort_key: (2, "unreachable"),
+            sort_key: (2, "println"),
         },
         SortableMatch {
             string_match: StringMatch {
@@ -1142,16 +1186,815 @@ fn test_sort_matches_for_exact_match(_cx: &mut TestAppContext) {
             .collect::<Vec<&str>>(),
         vec![
             "set_text",
-            "set_context_menu_options",
-            "set_placeholder_text",
             "set_text_style_refinement",
-            "select_to_end_of_excerpt",
-            "select_to_end_of_previous_excerpt",
-            "select_to_next_subword_end",
+            "set_placeholder_text",
+            "set_context_menu_options",
+            "set_custom_context_menu",
             "select_to_next_word_end",
+            "select_to_next_subword_end",
+            "select_to_end_of_excerpt",
             "select_to_start_of_excerpt",
             "select_to_start_of_next_excerpt",
-            "set_custom_context_menu"
+            "select_to_end_of_previous_excerpt",
         ]
+    );
+}
+
+#[gpui::test]
+fn test_sort_matches_for_prefix_matches(_cx: &mut TestAppContext) {
+    // Case 1: "set"
+    let query: Option<&str> = Some("set");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.12631578947368421,
+                positions: vec![],
+                string: "select_to_beginning".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "select_to_beginning"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.15000000000000002,
+                positions: vec![],
+                string: "set_collapse_matches".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "set_collapse_matches"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.21428571428571427,
+                positions: vec![],
+                string: "set_autoindent".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "set_autoindent"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.11538461538461539,
+                positions: vec![],
+                string: "set_all_diagnostics_active".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "set_all_diagnostics_active"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.1142857142857143,
+                positions: vec![],
+                string: "select_to_end_of_line".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "select_to_end_of_line"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.15000000000000002,
+                positions: vec![],
+                string: "select_all".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "select_all"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.13636363636363635,
+                positions: vec![],
+                string: "select_line".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "select_line"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.13636363636363635,
+                positions: vec![],
+                string: "select_left".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "select_left"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.13636363636363635,
+                positions: vec![],
+                string: "select_down".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "select_down"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "set_autoindent",
+            "set_collapse_matches",
+            "set_all_diagnostics_active",
+            "select_all",
+            "select_down",
+            "select_left",
+            "select_line",
+            "select_to_beginning",
+            "select_to_end_of_line",
+        ]
+    );
+}
+
+#[gpui::test]
+fn test_sort_matches_for_await(_cx: &mut TestAppContext) {
+    // Case 1: "awa"
+    let query: Option<&str> = Some("awa");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.6000000000000001,
+                positions: vec![],
+                string: "await".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (0, "await"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 35,
+                score: 0.375,
+                positions: vec![],
+                string: "await.ne".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000010"),
+            sort_key: (3, "await.ne"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 34,
+                score: 0.375,
+                positions: vec![],
+                string: "await.eq".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000010"),
+            sort_key: (3, "await.eq"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 18,
+                score: 0.375,
+                positions: vec![],
+                string: "await.or".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7ffffff8"),
+            sort_key: (3, "await.or"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 21,
+                score: 0.3333333333333333,
+                positions: vec![],
+                string: "await.zip".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000006"),
+            sort_key: (3, "await.zip"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 20,
+                score: 0.3333333333333333,
+                positions: vec![],
+                string: "await.xor".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7ffffff8"),
+            sort_key: (3, "await.xor"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 15,
+                score: 0.3333333333333333,
+                positions: vec![],
+                string: "await.and".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000006"),
+            sort_key: (3, "await.and"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 9,
+                score: 0.3333333333333333,
+                positions: vec![],
+                string: "await.map".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000006"),
+            sort_key: (3, "await.map"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 47,
+                score: 0.30000000000000004,
+                positions: vec![],
+                string: "await.take".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7ffffff8"),
+            sort_key: (3, "await.take"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "await",
+            "await.or",
+            "await.xor",
+            "await.take",
+            "await.and",
+            "await.map",
+            "await.zip",
+            "await.eq",
+            "await.ne"
+        ]
+    );
+    // Case 2: "await"
+    let query: Option<&str> = Some("await");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 1.0,
+                positions: vec![],
+                string: "await".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (0, "await"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 35,
+                score: 0.625,
+                positions: vec![],
+                string: "await.ne".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000010"),
+            sort_key: (3, "await.ne"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 34,
+                score: 0.625,
+                positions: vec![],
+                string: "await.eq".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000010"),
+            sort_key: (3, "await.eq"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 18,
+                score: 0.625,
+                positions: vec![],
+                string: "await.or".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7ffffff8"),
+            sort_key: (3, "await.or"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 21,
+                score: 0.5555555555555556,
+                positions: vec![],
+                string: "await.zip".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000006"),
+            sort_key: (3, "await.zip"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 20,
+                score: 0.5555555555555556,
+                positions: vec![],
+                string: "await.xor".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7ffffff8"),
+            sort_key: (3, "await.xor"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 15,
+                score: 0.5555555555555556,
+                positions: vec![],
+                string: "await.and".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000006"),
+            sort_key: (3, "await.and"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 9,
+                score: 0.5555555555555556,
+                positions: vec![],
+                string: "await.map".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000006"),
+            sort_key: (3, "await.map"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 47,
+                score: 0.5,
+                positions: vec![],
+                string: "await.take".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7ffffff8"),
+            sort_key: (3, "await.take"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "await",
+            "await.or",
+            "await.xor",
+            "await.take",
+            "await.and",
+            "await.map",
+            "await.zip",
+            "await.eq",
+            "await.ne"
+        ]
+    );
+}
+
+#[gpui::test]
+fn test_sort_matches_for_python_init(_cx: &mut TestAppContext) {
+    // Case 1: "__in"
+    let query: Option<&str> = Some("__in");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 211,
+                score: 0.5,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0003.__init__"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.5,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0003"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 215,
+                score: 0.23529411764705882,
+                positions: vec![],
+                string: "__instancecheck__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0005.__instancecheck__"),
+            sort_key: (3, "__instancecheck__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 213,
+                score: 0.23529411764705882,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0004.__init_subclass__"),
+            sort_key: (3, "__init_subclass__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 4,
+                score: 0.23529411764705882,
+                positions: vec![],
+                string: "__instancecheck__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0005"),
+            sort_key: (3, "__instancecheck__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 2,
+                score: 0.23529411764705882,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0004"),
+            sort_key: (3, "__init_subclass__"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "__init__",
+            "__init__",
+            "__init_subclass__",
+            "__init_subclass__",
+            "__instancecheck__",
+            "__instancecheck__",
+        ]
+    );
+    // Case 2: "__ini"
+    let query: Option<&str> = Some("__ini");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 9,
+                score: 0.625,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0004.__init__"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.625,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0004"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 10,
+                score: 0.29411764705882354,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0003.__init_subclass__"),
+            sort_key: (3, "__init_subclass__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 1,
+                score: 0.29411764705882354,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0003"),
+            sort_key: (3, "__init_subclass__"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "__init__",
+            "__init__",
+            "__init_subclass__",
+            "__init_subclass__",
+        ]
+    );
+    // Case 3: "__init"
+    let query: Option<&str> = Some("__init");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 7,
+                score: 0.75,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0000.__init__"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.75,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0000"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 8,
+                score: 0.3529411764705882,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0001.__init_subclass__"),
+            sort_key: (3, "__init_subclass__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 1,
+                score: 0.3529411764705882,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0001"),
+            sort_key: (3, "__init_subclass__"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "__init__",
+            "__init__",
+            "__init_subclass__",
+            "__init_subclass__",
+        ]
+    );
+    // Case 4: "__init_"
+    let query: Option<&str> = Some("__init_");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 4,
+                score: 0.875,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("11.9999.__init__"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.875,
+                positions: vec![],
+                string: "__init__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("11.9999"),
+            sort_key: (3, "__init__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 5,
+                score: 0.4117647058823529,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0000.__init_subclass__"),
+            sort_key: (3, "__init_subclass__"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 1,
+                score: 0.4117647058823529,
+                positions: vec![],
+                string: "__init_subclass__".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("05.0000"),
+            sort_key: (3, "__init_subclass__"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::Top);
+    assert_eq!(
+        matches
+            .iter()
+            .map(|m| m.string_match.string.as_str())
+            .collect::<Vec<&str>>(),
+        vec![
+            "__init__",
+            "__init__",
+            "__init_subclass__",
+            "__init_subclass__",
+        ]
+    );
+}
+
+#[gpui::test]
+fn test_sort_matches_for_rust_into(_cx: &mut TestAppContext) {
+    // Case 1: "int"
+    let query: Option<&str> = Some("int");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 67,
+                score: 0.75,
+                positions: vec![],
+                string: "into".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000004"),
+            sort_key: (3, "into"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 68,
+                score: 0.30000000000000004,
+                positions: vec![],
+                string: "try_into".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000004"),
+            sort_key: (3, "try_into"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 108,
+                score: 0.2571428571428571,
+                positions: vec![],
+                string: "println".to_string(),
+            },
+            is_snippet: true,
+            sort_text: Some("80000004"),
+            sort_key: (3, "println"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 73,
+                score: 0.24,
+                positions: vec![],
+                string: "clone_into".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000004"),
+            sort_key: (3, "clone_into"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 1,
+                score: 0.23076923076923078,
+                positions: vec![],
+                string: "into_searcher".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000000"),
+            sort_key: (3, "into_searcher"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 109,
+                score: 0.22499999999999998,
+                positions: vec![],
+                string: "eprintln".to_string(),
+            },
+            is_snippet: true,
+            sort_text: Some("80000004"),
+            sort_key: (3, "eprintln"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::default());
+    assert_eq!(
+        matches[0].string_match.string.as_str(),
+        "into",
+        "Match order not expected"
+    );
+    // Case 2: "into"
+    let query: Option<&str> = Some("into");
+    let mut matches: Vec<SortableMatch<'_>> = vec![
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 65,
+                score: 1.0,
+                positions: vec![],
+                string: "into".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000004"),
+            sort_key: (3, "into"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 66,
+                score: 0.4,
+                positions: vec![],
+                string: "try_into".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000004"),
+            sort_key: (3, "try_into"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 71,
+                score: 0.32,
+                positions: vec![],
+                string: "clone_into".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000004"),
+            sort_key: (3, "clone_into"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 0,
+                score: 0.3076923076923077,
+                positions: vec![],
+                string: "into_searcher".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("80000000"),
+            sort_key: (3, "into_searcher"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 27,
+                score: 0.09,
+                positions: vec![],
+                string: "split_terminator".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "split_terminator"),
+        },
+        SortableMatch {
+            string_match: StringMatch {
+                candidate_id: 28,
+                score: 0.08470588235294117,
+                positions: vec![],
+                string: "rsplit_terminator".to_string(),
+            },
+            is_snippet: false,
+            sort_text: Some("7fffffff"),
+            sort_key: (3, "rsplit_terminator"),
+        },
+    ];
+    CompletionsMenu::sort_matches(&mut matches, query, SnippetSortOrder::default());
+    assert_eq!(
+        matches[0].string_match.string.as_str(),
+        "into",
+        "Match order not expected"
     );
 }

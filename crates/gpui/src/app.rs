@@ -24,7 +24,7 @@ pub use async_context::*;
 use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
-use http_client::HttpClient;
+use http_client::{HttpClient, Url};
 use smallvec::SmallVec;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
@@ -1537,6 +1537,17 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Stops active drag and clears any related effects.
+    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
+        if self.active_drag.is_some() {
+            self.active_drag = None;
+            window.refresh();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Set the prompt renderer for GPUI. This will replace the default or platform specific
     /// prompts with this custom implementation.
     pub fn set_prompt_builder(
@@ -1890,7 +1901,7 @@ impl HttpClient for NullHttpClient {
         async move { Err(anyhow!("No HttpClient available")) }.boxed()
     }
 
-    fn proxy(&self) -> Option<&http_client::Uri> {
+    fn proxy(&self) -> Option<&Url> {
         None
     }
 
