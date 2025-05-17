@@ -712,7 +712,7 @@ impl Pane {
         !self.nav_history.0.lock().forward_stack.is_empty()
     }
 
-    fn navigate_backward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn navigate_backward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
             let pane = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
@@ -1857,7 +1857,7 @@ impl Pane {
                     matches!(
                         item.workspace_settings(cx).autosave,
                         AutosaveSetting::OnFocusChange | AutosaveSetting::OnWindowChange
-                    ) && Self::can_autosave_item(item, cx)
+                    ) && item.can_autosave(cx)
                 })?;
                 if !will_autosave {
                     let item_id = item.item_id();
@@ -1945,11 +1945,6 @@ impl Pane {
         })
     }
 
-    fn can_autosave_item(item: &dyn ItemHandle, cx: &App) -> bool {
-        let is_deleted = item.project_entry_ids(cx).is_empty();
-        item.is_dirty(cx) && !item.has_conflict(cx) && item.can_save(cx) && !is_deleted
-    }
-
     pub fn autosave_item(
         item: &dyn ItemHandle,
         project: Entity<Project>,
@@ -1960,7 +1955,7 @@ impl Pane {
             item.workspace_settings(cx).autosave,
             AutosaveSetting::AfterDelay { .. }
         );
-        if Self::can_autosave_item(item, cx) {
+        if item.can_autosave(cx) {
             item.save(format, project, window, cx)
         } else {
             Task::ready(Ok(()))
@@ -2671,11 +2666,7 @@ impl Pane {
                 }
             })
             .children(pinned_tabs.len().ne(&0).then(|| {
-                let content_width = self
-                    .tab_bar_scroll_handle
-                    .content_size()
-                    .map(|content_size| content_size.size.width)
-                    .unwrap_or(px(0.));
+                let content_width = self.tab_bar_scroll_handle.content_size().width;
                 let viewport_width = self.tab_bar_scroll_handle.viewport().size.width;
                 // We need to check both because offset returns delta values even when the scroll handle is not scrollable
                 let is_scrollable = content_width > viewport_width;
