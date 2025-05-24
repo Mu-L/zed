@@ -7,16 +7,16 @@ mod since_v0_3_0;
 mod since_v0_4_0;
 mod since_v0_5_0;
 mod since_v0_6_0;
-use extension::{KeyValueStoreDelegate, WorktreeDelegate};
+use extension::{DebugTaskDefinition, KeyValueStoreDelegate, WorktreeDelegate};
 use language::LanguageName;
 use lsp::LanguageServerName;
 use release_channel::ReleaseChannel;
-use since_v0_6_0 as latest;
 
 use super::{WasmState, wasm_engine};
 use anyhow::{Context as _, Result, anyhow};
 use semantic_version::SemanticVersion;
-use std::{ops::RangeInclusive, sync::Arc};
+use since_v0_6_0 as latest;
+use std::{ops::RangeInclusive, path::PathBuf, sync::Arc};
 use wasmtime::{
     Store,
     component::{Component, Linker, Resource},
@@ -25,7 +25,7 @@ use wasmtime::{
 #[cfg(test)]
 pub use latest::CodeLabelSpanLiteral;
 pub use latest::{
-    CodeLabel, CodeLabelSpan, Command, ExtensionProject, Range, SlashCommand,
+    CodeLabel, CodeLabelSpan, Command, DebugAdapterBinary, ExtensionProject, Range, SlashCommand,
     zed::extension::context_server::ContextServerConfiguration,
     zed::extension::lsp::{
         Completion, CompletionKind, CompletionLabelDetails, InsertTextFormat, Symbol, SymbolKind,
@@ -83,11 +83,10 @@ pub fn authorize_access_to_unreleased_wasm_api_version(
         }
     };
 
-    if !allow_unreleased_version {
-        Err(anyhow!(
-            "unreleased versions of the extension API can only be used on development builds of Zed"
-        ))?;
-    }
+    anyhow::ensure!(
+        allow_unreleased_version,
+        "unreleased versions of the extension API can only be used on development builds of Zed"
+    );
 
     Ok(())
 }
@@ -774,7 +773,7 @@ impl Extension {
                     .await
             }
             Extension::V0_0_1(_) | Extension::V0_0_4(_) | Extension::V0_0_6(_) => {
-                Err(anyhow!("`run_slash_command` not available prior to v0.1.0"))
+                anyhow::bail!("`run_slash_command` not available prior to v0.1.0");
             }
         }
     }
@@ -809,9 +808,9 @@ impl Extension {
             Extension::V0_0_1(_)
             | Extension::V0_0_4(_)
             | Extension::V0_0_6(_)
-            | Extension::V0_1_0(_) => Err(anyhow!(
-                "`context_server_command` not available prior to v0.2.0"
-            )),
+            | Extension::V0_1_0(_) => {
+                anyhow::bail!("`context_server_command` not available prior to v0.2.0");
+            }
         }
     }
 
@@ -836,9 +835,9 @@ impl Extension {
             | Extension::V0_1_0(_)
             | Extension::V0_2_0(_)
             | Extension::V0_3_0(_)
-            | Extension::V0_4_0(_) => Err(anyhow!(
-                "`context_server_configuration` not available prior to v0.5.0"
-            )),
+            | Extension::V0_4_0(_) => {
+                anyhow::bail!("`context_server_configuration` not available prior to v0.5.0");
+            }
         }
     }
 
@@ -854,9 +853,9 @@ impl Extension {
             Extension::V0_3_0(ext) => ext.call_suggest_docs_packages(store, provider).await,
             Extension::V0_2_0(ext) => ext.call_suggest_docs_packages(store, provider).await,
             Extension::V0_1_0(ext) => ext.call_suggest_docs_packages(store, provider).await,
-            Extension::V0_0_1(_) | Extension::V0_0_4(_) | Extension::V0_0_6(_) => Err(anyhow!(
-                "`suggest_docs_packages` not available prior to v0.1.0"
-            )),
+            Extension::V0_0_1(_) | Extension::V0_0_4(_) | Extension::V0_0_6(_) => {
+                anyhow::bail!("`suggest_docs_packages` not available prior to v0.1.0");
+            }
         }
     }
 
@@ -893,8 +892,48 @@ impl Extension {
                     .await
             }
             Extension::V0_0_1(_) | Extension::V0_0_4(_) | Extension::V0_0_6(_) => {
-                Err(anyhow!("`index_docs` not available prior to v0.1.0"))
+                anyhow::bail!("`index_docs` not available prior to v0.1.0");
             }
+        }
+    }
+    pub async fn call_get_dap_binary(
+        &self,
+        store: &mut Store<WasmState>,
+        adapter_name: Arc<str>,
+        task: DebugTaskDefinition,
+        user_installed_path: Option<PathBuf>,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<DebugAdapterBinary, String>> {
+        match self {
+            Extension::V0_6_0(ext) => {
+                let dap_binary = ext
+                    .call_get_dap_binary(
+                        store,
+                        &adapter_name,
+                        &task.try_into()?,
+                        user_installed_path.as_ref().and_then(|p| p.to_str()),
+                        resource,
+                    )
+                    .await?
+                    .map_err(|e| anyhow!("{e:?}"))?;
+
+                Ok(Ok(dap_binary))
+            }
+            _ => anyhow::bail!("`get_dap_binary` not available prior to v0.6.0"),
+        }
+    }
+
+    pub async fn call_dap_schema(&self, store: &mut Store<WasmState>) -> Result<String, String> {
+        match self {
+            Extension::V0_6_0(ext) => {
+                let schema = ext
+                    .call_dap_schema(store)
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+                schema
+            }
+            _ => Err("`get_dap_binary` not available prior to v0.6.0".to_string()),
         }
     }
 }
